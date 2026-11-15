@@ -1,0 +1,50 @@
+[project]
+name = "storyreel"
+version = "0.1.0"
+description = "Text-to-video studio that runs on weak laptops: chunked, streaming, crash-resumable."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=6.0",
+    "platformdirs>=4.2",
+]
+
+[project.scripts]
+storyreel = "storyreel.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-psutil",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/storyreel"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF", "PTH", "SIM"]
+ignore = ["S603", "S607"]  # subprocess with fixed argv lists is the core design (ffmpeg pipes)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = "src"
+files = ["src/storyreel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["ffmpeg: needs a working ffmpeg binary"]
