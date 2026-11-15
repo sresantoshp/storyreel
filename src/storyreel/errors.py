@@ -16,6 +16,7 @@ class ExitCode(IntEnum):
     ENV_CHECK_FAILED = 3  # doctor found a FAIL, or a required tool is missing
     RENDER_FAILED = 4
     RESOURCE_EXHAUSTED = 5  # memory cap, disk full, budget cap
+    INPUT_INVALID = 6  # every input file was unusable
     INTERRUPTED = 130
 
 

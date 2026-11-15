@@ -1,6 +1,6 @@
 """Command-line entry point: `storyreel <command>`.
 
-Only commands that actually work are registered. `render` and `make` arrive in Phases 1 and 4.
+Only commands that actually work are registered. `make` arrives in Phase 4.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from storyreel import __version__, doctor, logs, paths
+from storyreel import __version__, cli_project, doctor, logs, paths
 from storyreel.errors import ExitCode, StoryReelError
 from storyreel.hw import profile as hwprofile
 from storyreel.hw.sysinfo import GB, MB
@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-bench", action="store_true", help="skip disk/encoder benchmarks")
     p.add_argument("--disk-dir", help="directory to benchmark (default: StoryReel data dir)")
     p.set_defaults(func=_cmd_profile)
+    cli_project.register(sub)
     return ap
 
 

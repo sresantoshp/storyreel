@@ -1,0 +1,45 @@
+{
+  "label": "10s",
+  "seconds": 10.0,
+  "budget_mb": 2560,
+  "built": {
+    "clips": 5,
+    "import_s": 0.59
+  },
+  "peak_tree_rss_mb": 593,
+  "runs": [
+    {
+      "returncode": 0,
+      "killed": false,
+      "chunks_done": 1,
+      "wall_s": 9.92,
+      "peak_tree_rss_mb": 593,
+      "rss_samples": 51,
+      "summary": {
+        "event": "summary",
+        "output": "C:\\claude-code\\python-coding-learn-with-ai\\text-to-vedio\\bench\\.work\\bench-10s.mp4",
+        "chunks": 1,
+        "video_hits": 0,
+        "audio_hits": 0,
+        "video_rendered": 1,
+        "audio_rendered": 1,
+        "frames_expected": 300,
+        "frames_written": 300,
+        "duration_s": 10.0,
+        "wall_s": 8.709458200028166,
+        "peak_tree_rss": 617676800,
+        "peak_job_commit": 729989120,
+        "output_bytes": 294745,
+        "memory_retries": 0,
+        "hit_rate": 0.0
+      },
+      "chunk_fps_min": 36.3,
+      "chunk_fps_median": 36.3,
+      "stderr_tail": ""
+    }
+  ],
+  "machine": {
+    "ram_total_mb": 7825,
+    "cpu_logical": 8
+  }
+}

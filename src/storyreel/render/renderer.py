@@ -1,0 +1,319 @@
+"""Chunked renderer with a content-addressed chunk cache.
+
+For each chunk: video and audio are separate jobs with separate keys (a gain change
+re-renders only audio). A chunk counts as cached only if its cache_entry row exists and
+the file has the recorded size; rows are written after fsync + atomic rename, so a crash
+at any moment leaves either a complete, recorded chunk or nothing.
+
+Resume after a crash = run the same render again: finished chunks are cache hits.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+from storyreel.errors import ExitCode, StoryReelError
+from storyreel.jobs.runner import JobStats, MemoryPressureError, run_ffmpeg
+from storyreel.proc import run
+from storyreel.project.store import Project
+from storyreel.render import ffgraph
+from storyreel.render.plan import ChunkPlan, RenderSettings, load_timeline, plan_chunks
+from storyreel.watchdog import MemState, Watchdog
+
+log = logging.getLogger(__name__)
+Event = dict[str, Any]
+
+
+class RenderError(StoryReelError):
+    exit_code = ExitCode.RENDER_FAILED
+
+
+@dataclass
+class RenderSummary:
+    output: str
+    chunks: int
+    video_hits: int
+    audio_hits: int
+    video_rendered: int
+    audio_rendered: int
+    frames_expected: int
+    frames_written: int
+    duration_s: float
+    wall_s: float
+    peak_tree_rss: int
+    peak_job_commit: int
+    output_bytes: int
+    memory_retries: int
+
+    @property
+    def hit_rate(self) -> float:
+        total = 2 * self.chunks
+        return (self.video_hits + self.audio_hits) / total if total else 0.0
+
+
+def _fsync_replace(part: Path, final: Path) -> None:
+    with part.open("rb+") as fh:
+        os.fsync(fh.fileno())
+    part.replace(final)
+
+
+class Renderer:
+    def __init__(
+        self,
+        project: Project,
+        settings: RenderSettings,
+        *,
+        ffmpeg: Path,
+        ffprobe: Path,
+        watchdog: Watchdog,
+        on_event: Callable[[Event], None] | None = None,
+        max_memory_retries: int = 3,
+        resume_wait_s: float = 5.0,
+    ) -> None:
+        self.p = project
+        self.s = settings
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
+        self.wd = watchdog
+        self.emit = on_event or (lambda e: None)
+        self.max_memory_retries = max_memory_retries
+        self.resume_wait_s = resume_wait_s
+        self.peak_commit = 0
+        self.memory_retries = 0
+
+    # -- cache -------------------------------------------------------------------------
+    def _cached(self, key: str) -> Path | None:
+        row = self.p.con.execute(
+            "SELECT path, bytes FROM cache_entry WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        path = Path(row["path"])
+        try:
+            ok = path.stat().st_size == row["bytes"]
+        except OSError:
+            ok = False
+        if not ok:
+            self.p.con.execute("DELETE FROM cache_entry WHERE key = ?", (key,))
+            return None
+        self.p.con.execute(
+            "UPDATE cache_entry SET last_used_at = ? WHERE key = ?", (time.time(), key)
+        )
+        return path
+
+    def _store(self, key: str, kind: str, path: Path) -> None:
+        now = time.time()
+        self.p.con.execute(
+            "INSERT OR REPLACE INTO cache_entry(key, kind, path, bytes, created_at, last_used_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (key, kind, str(path), path.stat().st_size, now, now),
+        )
+
+    # -- one job with memory policy ----------------------------------------------------
+    def _wait_until_not_critical(self) -> None:
+        stable_since: float | None = None
+        last_note = 0.0
+        while True:
+            now = time.monotonic()
+            if self.wd.state is not MemState.CRITICAL:
+                stable_since = stable_since or now
+                if now - stable_since >= self.resume_wait_s:
+                    return
+            else:
+                stable_since = None
+                if now - last_note > 10:
+                    last = self.wd.last
+                    self.emit(
+                        {
+                            "event": "paused_memory",
+                            "sys_available_mb": (last.sys_available >> 20) if last else None,
+                        }
+                    )
+                    last_note = now
+            time.sleep(0.25)
+
+    def _run_job(self, build: Callable[[Path, bool], list[str]], final: Path) -> JobStats:
+        part = final.with_name(final.name + ".part")
+        low_mem = False
+        for attempt in range(self.max_memory_retries + 1):
+            if self.wd.state is MemState.CRITICAL:
+                self._wait_until_not_critical()
+            try:
+                stats = run_ffmpeg(build(part, low_mem), limit_bytes=self.wd.cap, watchdog=self.wd)
+            except MemoryPressureError:
+                part.unlink(missing_ok=True)
+                self.memory_retries += 1
+                if attempt == self.max_memory_retries:
+                    raise
+                self.emit({"event": "memory_retry", "attempt": attempt + 1, "low_mem": True})
+                low_mem = True
+                continue
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            _fsync_replace(part, final)
+            self.peak_commit = max(self.peak_commit, stats.peak_commit or 0)
+            return stats
+        raise AssertionError("unreachable")
+
+    def _video_argv(self, plan: ChunkPlan, part: Path, low_mem: bool) -> list[str]:
+        return ffgraph.video_argv(self.ffmpeg, plan, self.s, part, low_mem=low_mem)
+
+    def _audio_argv(self, plan: ChunkPlan, part: Path, low_mem: bool) -> list[str]:
+        return ffgraph.audio_argv(self.ffmpeg, plan, self.s, part)
+
+    # -- main --------------------------------------------------------------------------
+    def plan(self) -> list[ChunkPlan]:
+        return plan_chunks(load_timeline(self.p), self.s)
+
+    def render(self, out: Path) -> RenderSummary:
+        t0 = time.monotonic()
+        plans = self.plan()
+        if not plans:
+            raise RenderError(
+                "The timeline is empty; nothing to render.",
+                fix="Add clips with `storyreel append`.",
+            )
+        self.p.chunks_dir.mkdir(parents=True, exist_ok=True)
+        job_id = self._job_start(out)
+        rate = self.s.rate
+        vhits = ahits = vdone = adone = 0
+        ventries: list[tuple[Path, float]] = []
+        aentries: list[tuple[Path, float]] = []
+        self.emit({"event": "start", "chunks": len(plans), "frames": plans[-1].f1})
+        try:
+            for plan in plans:
+                dur = plan.frames * rate.den / rate.num
+                vkey, akey = plan.video_key(self.s), plan.audio_key(self.s)
+                vpath = self._cached(vkey)
+                if vpath is None:
+                    vpath = self.p.chunks_dir / f"{vkey}.mkv"
+                    st = self._run_job(partial(self._video_argv, plan), vpath)
+                    self._store(vkey, "vchunk", vpath)
+                    vdone += 1
+                    self.emit(
+                        {
+                            "event": "chunk",
+                            "kind": "video",
+                            "idx": plan.idx,
+                            "cached": False,
+                            "wall_s": round(st.wall_s, 3),
+                            "peak_rss_mb": st.peak_rss >> 20,
+                            "fps": round(plan.frames / st.wall_s, 1) if st.wall_s else None,
+                        }
+                    )
+                else:
+                    vhits += 1
+                    self.emit({"event": "chunk", "kind": "video", "idx": plan.idx, "cached": True})
+                apath = self._cached(akey)
+                if apath is None:
+                    apath = self.p.chunks_dir / f"{akey}.mka"
+                    self._run_job(partial(self._audio_argv, plan), apath)
+                    self._store(akey, "achunk", apath)
+                    adone += 1
+                else:
+                    ahits += 1
+                self.emit({"event": "chunk_done", "idx": plan.idx, "of": len(plans)})
+                ventries.append((vpath, dur))
+                aentries.append((apath, plan.samples / self.s.sample_rate))
+                self.p.con.execute(
+                    "UPDATE job SET progress = ? WHERE id = ?",
+                    ((plan.idx + 1) / len(plans), job_id),
+                )
+
+            self.emit({"event": "mux"})
+            out.parent.mkdir(parents=True, exist_ok=True)
+            vlist = self.p.renders_dir / "concat_video.ffconcat"
+            alist = self.p.renders_dir / "concat_audio.ffconcat"
+            self.p.renders_dir.mkdir(parents=True, exist_ok=True)
+            vlist.write_text(ffgraph.concat_list(ventries), encoding="utf-8")
+            alist.write_text(ffgraph.concat_list(aentries), encoding="utf-8")
+            part = out.with_name(out.name + ".part")
+            try:
+                run_ffmpeg(
+                    ffgraph.mux_argv(self.ffmpeg, vlist, alist, self.s, part),
+                    limit_bytes=self.wd.cap,
+                    watchdog=self.wd,
+                )
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            _fsync_replace(part, out)
+        except StoryReelError as exc:
+            self._job_end(job_id, "failed", exc.message)
+            if isinstance(exc, MemoryPressureError | RenderError):
+                raise
+            raise RenderError(f"Render failed: {exc.message}", fix=exc.fix) from exc
+        except BaseException as exc:
+            self._job_end(job_id, "failed", repr(exc))
+            raise
+
+        expected = plans[-1].f1
+        written = self.count_frames(out)
+        summary = RenderSummary(
+            output=str(out),
+            chunks=len(plans),
+            video_hits=vhits,
+            audio_hits=ahits,
+            video_rendered=vdone,
+            audio_rendered=adone,
+            frames_expected=expected,
+            frames_written=written,
+            duration_s=expected * rate.den / rate.num,
+            wall_s=time.monotonic() - t0,
+            peak_tree_rss=self.wd.peak_tree_rss,
+            peak_job_commit=self.peak_commit,
+            output_bytes=out.stat().st_size,
+            memory_retries=self.memory_retries,
+        )
+        self._job_end(job_id, "done", None, summary.peak_tree_rss)
+        self.emit({"event": "summary", **asdict(summary), "hit_rate": round(summary.hit_rate, 4)})
+        return summary
+
+    def count_frames(self, path: Path) -> int:
+        res = run(
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            timeout_s=600,
+        )
+        try:
+            return int(res.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError) as exc:
+            raise RenderError(f"Could not verify the output: {res.stdout[:200]!r}") from exc
+
+    # -- job bookkeeping ---------------------------------------------------------------
+    def _job_start(self, out: Path) -> int:
+        spec = json.dumps(
+            {"output": str(out), "settings": {**asdict(self.s), "rate": str(self.s.rate)}}
+        )
+        cur = self.p.con.execute(
+            "INSERT INTO job(kind, state, spec, attempts, created_at, started_at) "
+            "VALUES ('render', 'running', ?, 1, ?, ?)",
+            (spec, time.time(), time.time()),
+        )
+        return int(cur.lastrowid or 0)
+
+    def _job_end(self, job_id: int, state: str, err: str | None, peak: int | None = None) -> None:
+        self.p.con.execute(
+            "UPDATE job SET state = ?, last_error = ?, finished_at = ?, peak_rss = ? WHERE id = ?",
+            (state, err, time.time(), peak, job_id),
+        )

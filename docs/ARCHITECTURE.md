@@ -222,8 +222,10 @@ Invalidation rules:
    keys, so inserting a shot at minute 1 of a 2-hour film re-renders only the chunks that
    actually changed content. Chunk boundaries are anchored to edit points for the same reason.
 3. Engine or plugin version bump changes keys: you get correct output after an upgrade.
-4. Before trusting a hit: file exists, size matches `cache_entry.bytes`, `ffprobe` duration
-   matches within 1 frame (~50 ms per chunk, **estimate**). Fail → delete, re-render.
+4. Before trusting a hit: file exists and its size matches `cache_entry.bytes`. The row is
+   written only after fsync + atomic rename, so size-match is sufficient; the planned
+   per-chunk ffprobe check (~50 ms × 720 chunks = 36 s on a 2 h film) was dropped. The final
+   output's frame count is verified once with ffprobe instead.
 5. Generated assets are **pinned** (they cost money) and live in `assets/`, not `cache/`.
    Chunk/preview/proxy caches are evictable; default disk cap = min(20 GB, 25 % of free space);
    RAM preview cache 256 MB (128 MB on machines with < 6 GB RAM).
@@ -262,7 +264,17 @@ from *available* RAM at run time, never from the profile.
 |---|---|
 | NORMAL | Admit jobs. Full preview quality allowed. |
 | PRESSURE | Drop RAM caches to 25 %, `gc.collect()`, preview quality down one step, decoder ring buffers 3 → 2, scheduler admits **no new** jobs. |
-| CRITICAL | Send `stop` to running heavy workers: worker finishes the current frame, deletes the partial chunk, exits 0 with `stopped_for_memory`. Job → `PAUSED_MEMORY`. Not exited in 5 s → kill tree. Resume when NORMAL for 10 s. Preview → Proxy. |
+| CRITICAL | Kill the running chunk's ffmpeg (a half-encoded chunk is worthless anyway; it is a `.part` file and gets deleted). Wait until not CRITICAL for 5 s, retry the chunk with low-memory settings (`-threads 2`, `rc-lookahead=10`, `-filter_threads 1`). After 3 memory failures on one chunk the render stops with exit code 5; finished chunks stay cached. Preview → Proxy. |
+
+**Implemented in Phase 1 (differences from the first draft):**
+- PRESSURE pauses only *additional* jobs; one job always runs. Measured reason: this 7.6 GB
+  laptop sits at 4-12 % available with an IDE + browser open, i.e. permanently below the
+  10 % "system low" line. Blocking on it would hang every render.
+- System CRITICAL needs *both* < 5 % RAM available *and* > 90 % page file used. Low RAM
+  with a healthy page file means Windows is trimming other apps, which is slow but safe.
+- Path A chunks are a single ffmpeg process, so there is no Python worker in Phase 1:
+  ffmpeg itself is placed in the Job Object. Python worker processes arrive with the
+  numpy compositor (Phase 2) and use the same `jobs.limits.spawn`.
 
 Hysteresis gaps (80/70, 95/85) stop flapping. Losing a chunk costs ≤ 10 s of output.
 
