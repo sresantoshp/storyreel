@@ -10,3 +10,4 @@ __pycache__/
 dist/
 bench/.media/
 bench/.work/
+examples/out/

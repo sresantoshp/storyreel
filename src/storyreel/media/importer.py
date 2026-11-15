@@ -32,8 +32,8 @@ def _register(project: Project, path: Path, info: MediaInfo, fp: str) -> int:
     cur = project.con.execute(
         """INSERT INTO asset(kind, path, name, fingerprint, size_bytes, duration, width, height,
                fps_num, fps_den, vcodec, acodec, has_video, has_audio, sample_rate, channels,
-               imported_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               imported_at, color_space, pix_fmt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             info.kind,
             str(path),
@@ -52,6 +52,8 @@ def _register(project: Project, path: Path, info: MediaInfo, fp: str) -> int:
             info.sample_rate,
             info.channels,
             time.time(),
+            info.color_space,
+            info.pix_fmt,
         ),
     )
     return int(cur.lastrowid or 0)

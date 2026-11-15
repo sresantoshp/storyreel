@@ -1,5 +1,72 @@
 # Progress
 
+## 2026-11-15 — Phase 2: compositor, effects, text, environments
+
+Owner requirements recorded this phase: (1) the output is for a YouTube channel (Shorts +
+long-form), (2) **free, open source, offline only — no paid services** (ARCHITECTURE.md §0a).
+
+### Works
+- **Compositor (path B)** in a separate worker process under the Job Object cap; planar
+  `(rgb, alpha|None)` frames; affine warp into the layer's bounding box only; OpenCV blending.
+  Simple chunks still use the ffmpeg-only path A; chunks of both kinds concat with `-c copy`.
+- **Keyframes** on any transform or numeric effect parameter: hold / linear / cubic-bezier
+  (CSS semantics) with named easings. Ken Burns helper = one undo step.
+- **Transforms**: position, scale, scale_x/y, rotation, opacity, crop; decode at up to 2x
+  detail when a clip zooms in, so Ken Burns stays sharp.
+- **Text**: HarfBuzz shaping + FreeType rasterising (uharfbuzz, freetype-py); script
+  itemisation with per-script font fallback; Hindi, Tamil, Telugu, Kannada, Arabic verified
+  visually; fill/gradient, outline, shadow, box (lower thirds); animations typewriter / fade /
+  slide / pop per letter-cluster or word (clusters from HarfBuzz, so conjuncts never split).
+- **Effects**: color (exposure, temperature, tint, lift/gamma/gain, contrast, saturation),
+  curves, 3D LUT (.cube via ffmpeg lut3d, with mix), color match (Reinhard/Lab), blur,
+  sharpen, glow, vignette, grain, chromatic aberration, glitch, lens distortion, polygon
+  mask with feather, chroma key with spill suppression; presets teal-orange, noir,
+  documentary, night; adjustment clips.
+- **Transitions**: dissolve, fade_black, wipe ×4, slide ×2, zoom, whip; centred on the cut,
+  source handles used, frozen first/last frame when there are none.
+- **Speed**: constant 0.1x-16x (audio via atempo), speed ramps via keyframes (frame blend
+  optional), reverse (video in 12-frame blocks; audio per chunk), freeze.
+- **Environments** (pure functions of time + seed): gradient, starfield, rain, snow, fog,
+  fire, particles.
+- **CLI**: text, env, adjust, fx, kenburns, keyframe, transition, set, speed, frame, undo,
+  redo; `info --clips`. `examples/phase2_demo.py` builds an 18 s scene with CLI calls only.
+- 94 tests (exact-pixel transform/blend/transition checks, path A/B equivalence, speed and
+  reverse source mapping, Indic shaping, golden frames by SSIM); ruff + mypy --strict clean.
+
+### Measured (same laptop; 0.5-1.1 GB RAM free during runs)
+
+| Test | Result |
+|---|---|
+| Demo, 18 s 1080p, 3 scenes, up to 7 layers | 540/540 frames, **peak RSS 833 MB**, job commit 1110 MB, 175 s wall (3.1 fps) |
+| Compositor fps at 1080p, per demo scene | starfield+2 titles 8.2; photo+KB+grade+fog+rain+lower-third+dissolve 3.8; fire+embers+typewriter 5.1 |
+| Same 4-layer scene at 720p / 1080p | 9.5 / 4.9 fps (was 4.5 fps at 720p before optimisation) |
+| Colour effect at 720p | 4 ms (LUT) vs 125 ms (float numpy) |
+| Generators at 1080p | rain 7, fog 9, snow 11, particles 16, fire 19, starfield(1400) 19 ms/frame |
+| Text layout / styled frame | 26 ms once / memoised per animation state |
+| Path A vs path B, same plain clip | frame timing identical; worst-frame PSNR 36.9 dB (chroma round trip) |
+| Path A 10 s 1080p bench (regression) | 300/300 frames, 634 MB peak, PASS |
+
+### Bugs found by tests/visual review this phase (all fixed)
+Decoder `-map` vs filtergraph conflict; fog nearly invisible (6 % mean alpha); fire drawn at
+the top of the frame and blocky; bicubic upscale overshoot (alpha −0.02/1.01); path A not
+converting the BT.601 matrix (swscale skips yuv→yuv matrix changes); path B picking a
+different source frame than ffmpeg's fps filter at 25→30 fps.
+
+### Honest limits
+- **Render speed for effect-heavy 1080p is 3-5 fps on this laptop.** A 60 s story ≈ 4-6 min;
+  an 8-min fully-composited video ≈ 30-45 min at 1080p (≈ half at 720p). Simple footage
+  edits stay on path A at 35-90 fps. Next levers: parallel chunk workers when RAM is free,
+  OpenCL (cv2.UMat on the Intel iGPU), 8-bit blending.
+- Mixed-direction (bidi) text within one line is not reordered; single-direction lines are.
+- Text currently uses OS fonts (Nirmala UI on Windows). Bundling Noto (OFL) is planned so
+  projects render identically on any machine.
+- Not done (need models; Phase 4+): depth-map 2.5D parallax, AI background removal,
+  stabilisation, optical-flow slow motion (frame blend instead).
+
+### Next: Phase 3 (audio engine)
+Buses, ducking, EQ/compressor/limiter/reverb, loudness targeting (−14 LUFS YouTube),
+5.1/7.1, stems, meters; verify with ffmpeg ebur128 to ±0.5 LU.
+
 ## 2026-11-15 — Phase 1: engine core (no UI)
 
 ### Works

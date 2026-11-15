@@ -157,6 +157,26 @@ def cmd_info(a: argparse.Namespace) -> int:
                 (t["id"],),
             ).fetchone()
             print(f"  track {t['name']:<4} {row['n']:>5} clips, ends at {row['e'] / FLICKS:.2f} s")
+            if a.clips:
+                for c in p.con.execute(
+                    "SELECT c.*, a.name AS aname FROM clip c "
+                    "LEFT JOIN asset a ON a.id = c.asset_id "
+                    "WHERE track_id = ? ORDER BY start",
+                    (t["id"],),
+                ):
+                    props = json.loads(c["props"])
+                    what = (
+                        c["aname"]
+                        or props.get("type")
+                        or str(props.get("text", ""))[:30]
+                        or props.get("color", c["kind"])
+                    )
+                    speed = c["speed_num"] / c["speed_den"]
+                    extra = f" {speed:g}x" if speed != 1 else ""
+                    print(
+                        f"      clip #{c['id']:<5} {c['start'] / FLICKS:8.2f} s +"
+                        f"{c['duration'] / FLICKS:7.2f} s  {c['kind']:<9} {what}{extra}"
+                    )
     return int(ExitCode.OK)
 
 
@@ -245,6 +265,7 @@ def register(sub: Any) -> None:
 
     f = sub.add_parser("info", help="show assets and tracks")
     f.add_argument("project")
+    f.add_argument("--clips", action="store_true", help="list every clip with its id")
     f.set_defaults(func=cmd_info)
 
     r = sub.add_parser("render", help="render the timeline (resumes from cached chunks)")

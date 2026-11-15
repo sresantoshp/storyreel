@@ -1,19 +1,32 @@
-"""Chunk plan → ffmpeg argv (path A: everything inside one ffmpeg filtergraph).
+"""ffmpeg argv builders.
 
-Video chunk: black base + one input per layer, each normalised (fps, fit-scale, pad,
-yuv420p), delayed to its position, overlaid bottom-to-top. Exactly `frames` frames out.
-Audio chunk: silent base + one input per layer, resampled, gained, delayed (sample-exact),
-mixed without normalisation, padded/trimmed to exactly `samples` samples, 32-bit float PCM.
+Video path A: black base + one input per layer, each normalised (fps, fit-scale with an
+explicit YUV matrix → BT.709, pad, yuv420p), delayed to its position, overlaid bottom-to-top.
+Video path B: the worker (render/worker.py) encodes compositor output with the same
+`encoder_args`, so chunks from both paths concatenate with `-c copy` and match in colour.
+Audio: silent base + one input per layer: resample, [reverse], [atempo], trim, gain,
+sample-exact delay, mix without normalisation, pad/trim to exactly `samples`, f32 PCM.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from storyreel.render.plan import ChunkPlan, RenderSettings
+from storyreel.render.plan import ChunkPlan, RenderSettings, atempo_chain
 from storyreel.timebase import sec_str
 
 COMMON = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-nostats", "-progress", "pipe:1"]
+COLOR_TAGS = [
+    "-colorspace",
+    "bt709",
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+    "-color_range",
+    "tv",
+]
 
 
 def _layout(channels: int) -> str:
@@ -21,7 +34,33 @@ def _layout(channels: int) -> str:
         return "mono"
     if channels == 2:
         return "stereo"
-    raise ValueError("Phase 1 renders mono or stereo; 5.1/7.1 arrive with the Phase 3 audio engine")
+    raise ValueError("Phase 2 renders mono or stereo; 5.1/7.1 arrive with the Phase 3 audio engine")
+
+
+def encoder_args(s: RenderSettings, *, low_mem: bool = False) -> list[str]:
+    gop = max(1, round(2 * s.rate.fps))
+    args = [
+        "-c:v",
+        s.vcodec,
+        "-preset",
+        s.preset,
+        "-crf",
+        str(s.crf),
+        "-g",
+        str(gop),
+        "-pix_fmt",
+        s.pix_fmt,
+        *COLOR_TAGS,
+    ]
+    if low_mem:
+        args += ["-threads", "2", "-x264-params", "rc-lookahead=10", "-filter_threads", "1"]
+    return args
+
+
+def rgb_encoder_args(s: RenderSettings, *, low_mem: bool = False) -> list[str]:
+    """For rgb24 input (path B): convert with the BT.709 matrix into limited-range YUV."""
+    vf = f"scale=out_color_matrix=bt709:out_range=tv,format={s.pix_fmt}"
+    return ["-vf", vf, *encoder_args(s, low_mem=low_mem)]
 
 
 def video_argv(
@@ -50,9 +89,15 @@ def video_argv(
         else:
             argv += ["-f", "lavfi", "-i", f"color=c=0x{layer.color}:s={w}x{h}:r={fps}:d={in_dur}"]
         at = layer.at * s.rate.den / s.rate.num
+        # swscale does not change the YUV matrix in a yuv->yuv scale, so convert explicitly
+        # (matrix only, like path B's decoder; primaries and transfer are left alone)
+        cs = {"bt601": "bt470bg", "bt2020": "bt2020ncl"}.get(layer.matrix)
+        convert = (f"colorspace=space=bt709:ispace={cs}:primaries=bt709:iprimaries=bt709:"
+                   f"trc=bt709:itrc=bt709:range=tv:irange=tv," if cs else "")  # fmt: skip
         chains.append(
-            f"[{i}:v]setpts=PTS-STARTPTS,fps={fps},"
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v]setpts=PTS-STARTPTS,fps={fps},{convert}"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic"
+            f":out_color_matrix=bt709:out_range=tv,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,"
             f"trim=end_frame={layer.frames},setpts=PTS+{at:.6f}/TB[l{i}]"
         )
@@ -61,22 +106,8 @@ def video_argv(
         chains.append(f"[{prev}][l{i}]overlay=eof_action=pass:repeatlast=0[o{i}]")
         prev = f"o{i}"
     chains.append(f"[{prev}]format={s.pix_fmt}[vout]")
-    gop = max(1, round(2 * s.rate.fps))
     argv += ["-filter_complex", ";".join(chains), "-map", "[vout]", "-frames:v", str(plan.frames)]
-    argv += [
-        "-c:v",
-        s.vcodec,
-        "-preset",
-        s.preset,
-        "-crf",
-        str(s.crf),
-        "-g",
-        str(gop),
-        "-pix_fmt",
-        s.pix_fmt,
-    ]
-    if low_mem:
-        argv += ["-threads", "2", "-x264-params", "rc-lookahead=10", "-filter_threads", "1"]
+    argv += encoder_args(s, low_mem=low_mem)
     argv += ["-f", "matroska", str(out)]
     return argv
 
@@ -93,13 +124,28 @@ def audio_argv(ffmpeg: Path, plan: ChunkPlan, s: RenderSettings, out: Path) -> l
     ]
     chains: list[str] = []
     for i, layer in enumerate(plan.alayers, start=1):
-        in_dur = f"{layer.samples / sr + 0.05:.6f}"
+        speed = layer.speed[0] / layer.speed[1]
+        src_samples = math.ceil(layer.samples * speed)
+        in_dur = f"{src_samples / sr + 0.05:.6f}"
         argv += ["-ss", sec_str(layer.src_in), "-t", in_dur, "-i", str(layer.path)]
-        chains.append(
-            f"[{i}:a]aresample={sr},aformat=sample_fmts=fltp:channel_layouts={layout},"
-            f"asetpts=PTS-STARTPTS,atrim=end_sample={layer.samples},"
-            f"volume={layer.gain_db:.3f}dB,adelay=delays={layer.at}S:all=1[a{i}]"
-        )
+        steps = [
+            f"aresample={sr}",
+            f"aformat=sample_fmts=fltp:channel_layouts={layout}",
+            "asetpts=PTS-STARTPTS",
+            f"atrim=end_sample={src_samples}",
+        ]
+        if layer.reverse:
+            steps.append("areverse")  # bounded: one chunk (<= 10 s) of audio
+        tempo = atempo_chain(layer.speed)
+        if tempo:
+            steps.append(tempo)
+        steps += [
+            f"apad=whole_len={layer.samples}",
+            f"atrim=end_sample={layer.samples}",
+            f"volume={layer.gain_db:.3f}dB",
+            f"adelay=delays={layer.at}S:all=1",
+        ]
+        chains.append(f"[{i}:a]" + ",".join(steps) + f"[a{i}]")
     inputs = "".join(f"[{x}]" for x in ["0:a", *(f"a{i}" for i in range(1, len(plan.alayers) + 1))])
     chains.append(
         f"{inputs}amix=inputs={len(plan.alayers) + 1}:duration=first:normalize=0,"

@@ -8,6 +8,9 @@ dependencies = [
     "psutil>=6.0",
     "platformdirs>=4.2",
     "numpy>=2.1",
+    "opencv-python-headless>=4.10",
+    "uharfbuzz>=0.40",
+    "freetype-py>=2.5",
 ]
 
 [project.scripts]
@@ -38,6 +41,7 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF", "PTH", "SIM"]
 ignore = [
     "S603", "S607",  # subprocess with fixed argv lists is the core design (ffmpeg pipes)
     "S101",  # asserts only narrow types of Popen pipes that are always set
+    "RUF046",  # int(round(x)): with numpy scalars round() may not return a Python int
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -50,6 +54,10 @@ strict = true
 python_version = "3.11"
 mypy_path = "src"
 files = ["src/storyreel"]
+
+[[tool.mypy.overrides]]
+module = ["uharfbuzz", "freetype", "freetype.*"]  # C extensions without type stubs
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

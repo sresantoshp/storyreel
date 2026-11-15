@@ -5,7 +5,14 @@ Chunking: walk the timeline in frames; each chunk ends at the farthest edit poin
 whenever possible, an edit that only shifts later clips reproduces the same chunks (and
 the same cache keys) after the first edit point that follows it.
 
-Cache keys use times relative to the chunk start and asset fingerprints (not paths).
+Two render paths per chunk:
+  A (ffmpeg filtergraph): every layer is a plain video/image/color clip at 1x speed with
+    no transform, keyframes, effects or transitions. Fastest.
+  B (numpy compositor in a worker process): anything else. Layer details travel in
+    `VLayer.extra` (canonical JSON), which is also part of the cache key.
+
+Cache keys use times relative to the chunk / clip start and asset fingerprints (not paths).
+Every frame is a pure function of its inputs, so transitions may straddle chunk boundaries.
 """
 
 from __future__ import annotations
@@ -14,14 +21,16 @@ import bisect
 import hashlib
 import json
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import Any
 
 from storyreel.errors import StoryReelError
 from storyreel.project.store import Project
 from storyreel.timebase import FLICKS, Rate
 
-ENGINE_VERSION = "1"  # bump when render output changes for the same inputs
+ENGINE_VERSION = "3"  # bump when render output changes for the same inputs
 _HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
 
@@ -39,6 +48,7 @@ class RenderSettings:
     acodec: str = "aac"
     abitrate: str = "192k"
     chunk_seconds: float = 10.0
+    force_path_b: bool = False  # tests: render simple chunks through the compositor too
 
     @property
     def chunk_frames(self) -> int:
@@ -64,7 +74,7 @@ class TimelineClip:
     clip_id: int
     track_kind: str  # video | audio
     track_idx: int
-    kind: str  # media | color
+    kind: str  # media | color | text | generator | adjust
     start: int  # flicks
     duration: int
     src_in: int
@@ -73,16 +83,38 @@ class TimelineClip:
     asset_kind: str | None  # video | image | audio
     path: str | None
     fingerprint: str | None
+    speed: tuple[int, int] = (1, 1)
+    props: dict[str, Any] = field(default_factory=dict)
+    keyframes: dict[str, list[list[float]]] = field(default_factory=dict)
+    effects: list[dict[str, Any]] = field(default_factory=list)
+    asset: dict[str, Any] = field(default_factory=dict)
+    trans_in: dict[str, Any] | None = None  # this clip is B of a transition
+    trans_out: dict[str, Any] | None = None  # this clip is A of a transition
+
+    @property
+    def simple(self) -> bool:
+        extra_props = {k for k in self.props if k != "color"}
+        return (
+            self.kind in ("media", "color")
+            and not extra_props
+            and not self.keyframes
+            and not self.effects
+            and self.speed == (1, 1)
+            and self.trans_in is None
+            and self.trans_out is None
+        )
 
 
 @dataclass(frozen=True)
 class VLayer:
-    kind: str  # video | image | color
+    kind: str  # video | image | color | text | generator | adjust
     at: int  # first frame within the chunk
     frames: int
-    src_in: int  # flicks into the source at the layer's first frame (video only)
+    src_in: int  # path A: flicks at the layer's first frame; path B: clip src_in
     color: str | None
     fingerprint: str | None
+    extra: str = ""  # path B: canonical JSON (clip offset, props, keyframes, effects, ...)
+    matrix: str = ""  # path A video: YUV matrix of the source (bt709 / bt601 / bt2020)
     path: str | None = field(default=None, compare=False)
 
 
@@ -90,10 +122,12 @@ class VLayer:
 class ALayer:
     at: int  # first sample within the chunk
     samples: int
-    src_in: int  # flicks
+    src_in: int  # flicks: source position where this layer's audio starts (pre-reverse)
     gain_db: float
     fingerprint: str
     path: str = field(default="", compare=False)
+    speed: tuple[int, int] = (1, 1)
+    reverse: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +148,10 @@ class ChunkPlan:
     def samples(self) -> int:
         return self.s1 - self.s0
 
+    @property
+    def path_b(self) -> bool:
+        return any(layer.extra for layer in self.vlayers)
+
     def _key(self, kind: str, settings: dict[str, Any], layers: tuple[Any, ...], n: int) -> str:
         payload = {
             "engine": ENGINE_VERSION,
@@ -131,12 +169,66 @@ class ChunkPlan:
     def audio_key(self, s: RenderSettings) -> str:
         return self._key("a", s.audio_key(), self.alayers, self.samples)
 
+    def worker_layers(self) -> list[dict[str, Any]]:
+        """Layer specs for the path-B worker (paths included)."""
+        out = []
+        for layer in self.vlayers:
+            if not layer.extra:
+                raise StoryReelError("internal: simple layer in a path-B chunk")
+            spec: dict[str, Any] = json.loads(layer.extra)
+            spec |= {
+                "kind": layer.kind,
+                "at": layer.at,
+                "frames": layer.frames,
+                "src_in": layer.src_in,
+                "path": layer.path,
+            }
+            out.append(spec)
+        return out
+
+
+def color_matrix(height: int | None, tag: str | None) -> str:
+    """YUV matrix for a source: its tag if known, else BT.709 for >= 720p, BT.601 below."""
+    tags = {
+        "bt709": "bt709",
+        "smpte170m": "bt601",
+        "bt470bg": "bt601",
+        "bt2020nc": "bt2020",
+        "bt2020c": "bt2020",
+    }
+    if tag in tags:
+        return tags[tag]
+    return "bt709" if (height or 1080) >= 720 else "bt601"
+
+
+def _canon(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
 
 def load_timeline(project: Project) -> list[TimelineClip]:
-    rows = project.con.execute(
+    con = project.con
+    kfs: dict[int, dict[str, list[list[float]]]] = defaultdict(lambda: defaultdict(list))
+    for k in con.execute("SELECT * FROM keyframe ORDER BY clip_id, param, t"):
+        kfs[k["clip_id"]][k["param"]].append(
+            [k["t"], k["value"], k["interp"], k["h1x"], k["h1y"], k["h2x"], k["h2y"]]
+        )
+    fxs: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for e in con.execute("SELECT * FROM effect WHERE enabled = 1 ORDER BY clip_id, idx"):
+        fxs[e["clip_id"]].append(
+            {"id": e["id"], "type": e["type"], "params": json.loads(e["params"])}
+        )
+    t_in: dict[int, dict[str, Any]] = {}
+    t_out: dict[int, dict[str, Any]] = {}
+    for t in con.execute("SELECT * FROM transition"):
+        row = {"kind": t["kind"], "duration": t["duration"]}
+        t_out[t["clip_a"]] = row
+        t_in[t["clip_b"]] = row
+
+    rows = con.execute(
         """SELECT c.id, t.kind AS tkind, t.idx, c.kind, c.start, c.duration, c.src_in,
                   c.speed_num, c.speed_den, c.gain_db, c.props,
-                  a.kind AS akind, a.path, a.fingerprint, a.status, a.name
+                  a.kind AS akind, a.path, a.fingerprint, a.status, a.name, a.width, a.height,
+                  a.fps_num, a.fps_den, a.duration AS adur, a.color_space, a.pix_fmt
            FROM clip c JOIN track t ON t.id = c.track_id
            LEFT JOIN asset a ON a.id = c.asset_id
            WHERE t.muted = 0
@@ -144,22 +236,38 @@ def load_timeline(project: Project) -> list[TimelineClip]:
     ).fetchall()
     out: list[TimelineClip] = []
     for r in rows:
-        if (r["speed_num"], r["speed_den"]) != (1, 1):
-            raise StoryReelError(
-                f"Clip {r['id']} has a speed change; speed ramps arrive with the Phase 2 "
-                "compositor and the Phase 1 renderer refuses rather than rendering it wrong."
-            )
         if r["kind"] == "media" and r["status"] != "ok":
             raise StoryReelError(
                 f"Clip {r['id']} uses {r['name']}, which is {r['status']}.",
                 fix="Relink or remove the clip.",
             )
+        props = json.loads(r["props"])
         color = None
         if r["kind"] == "color":
-            m = _HEX.match(str(json.loads(r["props"]).get("color", "")))
+            m = _HEX.match(str(props.get("color", "")))
             if m is None:
                 raise StoryReelError(f"Clip {r['id']} has an invalid color.")
             color = m.group(1).lower()
+        effects = fxs.get(r["id"], [])
+        if any(e["type"] == "lut" for e in effects) and r["akind"] not in ("video", "image"):
+            raise StoryReelError(
+                f"Clip {r['id']}: LUTs apply to video and image clips only.",
+                fix="Put the LUT on the media clip, not on text/adjustment.",
+            )
+        asset = (
+            {
+                "kind": r["akind"],
+                "width": r["width"],
+                "height": r["height"],
+                "fps_num": r["fps_num"],
+                "fps_den": r["fps_den"],
+                "duration": r["adur"],
+                "color_space": r["color_space"],
+                "pix_fmt": r["pix_fmt"],
+            }
+            if r["akind"]
+            else {}
+        )
         out.append(
             TimelineClip(
                 r["id"],
@@ -174,6 +282,13 @@ def load_timeline(project: Project) -> list[TimelineClip]:
                 r["akind"],
                 r["path"],
                 r["fingerprint"],
+                (r["speed_num"], r["speed_den"]),
+                props,
+                {k: v for k, v in kfs.get(r["id"], {}).items()},
+                effects,
+                asset,
+                t_in.get(r["id"]),
+                t_out.get(r["id"]),
             )
         )
     return out
@@ -197,49 +312,151 @@ def chunk_bounds(edit_frames: list[int], total: int, max_frames: int) -> list[tu
     return out
 
 
-def plan_chunks(clips: list[TimelineClip], s: RenderSettings) -> list[ChunkPlan]:
+@dataclass(frozen=True)
+class _VSpan:
+    lo: int  # visible frames [lo, hi) including transition extensions
+    hi: int
+    a: int  # clip start frame (clip-local 0)
+    clip_frames: int
+    transitions: tuple[dict[str, Any], ...]
+    clip: TimelineClip
+
+
+def _vspan(c: TimelineClip, rate: Rate) -> _VSpan:
+    a = rate.flicks_to_frame(c.start)
+    b = rate.flicks_to_frame(c.start + c.duration)
+    lo, hi = a, b
+    trans: list[dict[str, Any]] = []
+    if c.trans_out is not None:
+        d = max(1, rate.flicks_to_frame(c.trans_out["duration"]))
+        hi = b + (d - d // 2)
+        trans.append(
+            {"kind": c.trans_out["kind"], "role": "out", "start": b - d // 2 - a, "frames": d}
+        )
+    if c.trans_in is not None:
+        d = max(1, rate.flicks_to_frame(c.trans_in["duration"]))
+        lo = a - d // 2
+        trans.append({"kind": c.trans_in["kind"], "role": "in", "start": -(d // 2), "frames": d})
+    return _VSpan(max(lo, 0), hi, a, b - a, tuple(trans), c)
+
+
+def _vlayer(sp: _VSpan, o0: int, o1: int, f0: int, rate: Rate, force_b: bool) -> VLayer:
+    c = sp.clip
+    kind = c.kind if c.kind != "media" else str(c.asset_kind)
+    if c.simple and not force_b:
+        src = c.src_in + rate.frame_to_flicks(o0) - rate.frame_to_flicks(sp.a)
+        matrix = (
+            color_matrix(c.asset.get("height"), c.asset.get("color_space"))
+            if kind == "video"
+            else ""
+        )
+        return VLayer(
+            kind,
+            o0 - f0,
+            o1 - o0,
+            src if kind == "video" else 0,
+            c.color,
+            c.fingerprint,
+            "",
+            matrix,
+            c.path,
+        )
+    extra = {
+        "clip_offset": o0 - sp.a,
+        "clip_frames": sp.clip_frames,
+        "speed": list(c.speed),
+        "props": c.props,
+        "keyframes": c.keyframes,
+        "effects": c.effects,
+        "transitions": list(sp.transitions),
+        "asset": c.asset,
+    }
+    if c.kind == "color":
+        extra["props"] = {**c.props, "color": f"#{c.color}"}
+    return VLayer(
+        kind, o0 - f0, o1 - o0, c.src_in, c.color, c.fingerprint, _canon(extra), "", c.path
+    )
+
+
+def _atempo(speed: float) -> str:
+    parts = []
+    while speed < 0.5:
+        parts.append("atempo=0.5")
+        speed /= 0.5
+    while speed > 100.0:
+        parts.append("atempo=100")
+        speed /= 100.0
+    if abs(speed - 1.0) > 1e-9:
+        parts.append(f"atempo={speed:.6f}")
+    return ",".join(parts)
+
+
+def plan_chunks(
+    clips: list[TimelineClip], s: RenderSettings, warnings: list[str] | None = None
+) -> list[ChunkPlan]:
     rate, sr = s.rate, s.sample_rate
     vclips = [c for c in clips if c.track_kind == "video"]
     aclips = [c for c in clips if c.track_kind == "audio"]
-    vspan = [
-        (rate.flicks_to_frame(c.start), rate.flicks_to_frame(c.start + c.duration), c)
-        for c in vclips
-    ]
-    edits = [f for a, b, _ in vspan for f in (a, b)]
+    vspans = [_vspan(c, rate) for c in vclips]
+    vspans.sort(key=lambda v: (v.clip.track_idx, v.a))
+    edits = [f for v in vspans for f in (v.lo, v.hi)]
     edits += [rate.flicks_to_frame(t) for c in aclips for t in (c.start, c.start + c.duration)]
     total = max(edits, default=0)
     if total == 0:
         return []
-    aspan = [(_sample_of(c.start, sr), _sample_of(c.start + c.duration, sr), c) for c in aclips]
-    vspan.sort(key=lambda x: (x[2].track_idx, x[0]))
+
+    aspans: list[tuple[int, int, TimelineClip]] = []
+    for c in aclips:
+        if c.props.get("freeze") or "speed" in c.keyframes:
+            if warnings is not None:
+                why = "frozen" if c.props.get("freeze") else "has a speed ramp"
+                warnings.append(
+                    f"Audio clip {c.clip_id} {why}; its sound is muted "
+                    "(ramped audio arrives with the Phase 3 audio engine)."
+                )
+            continue
+        aspans.append((_sample_of(c.start, sr), _sample_of(c.start + c.duration, sr), c))
 
     plans: list[ChunkPlan] = []
     for idx, (f0, f1) in enumerate(chunk_bounds(edits, total, s.chunk_frames)):
         vl: list[VLayer] = []
-        for a, b, c in vspan:
-            o0, o1 = max(a, f0), min(b, f1)
-            if o0 >= o1:
-                continue
-            src = c.src_in + rate.frame_to_flicks(o0) - rate.frame_to_flicks(a)
-            kind = "color" if c.kind == "color" else str(c.asset_kind)
-            vl.append(
-                VLayer(
-                    kind,
-                    o0 - f0,
-                    o1 - o0,
-                    src if kind == "video" else 0,
-                    c.color,
-                    c.fingerprint,
-                    c.path,
-                )
-            )
+        for sp in vspans:
+            o0, o1 = max(sp.lo, f0), min(sp.hi, f1)
+            if o0 < o1:
+                vl.append(_vlayer(sp, o0, o1, f0, rate, s.force_path_b))
+        if any(layer.extra for layer in vl) and not all(layer.extra for layer in vl):
+            # mixed chunk: express simple layers for the compositor too
+            vl = [
+                _vlayer(sp, max(sp.lo, f0), min(sp.hi, f1), f0, rate, True)
+                for sp in vspans
+                if max(sp.lo, f0) < min(sp.hi, f1)
+            ]
         s0, s1 = rate.frame_to_sample(f0, sr), rate.frame_to_sample(f1, sr)
         al: list[ALayer] = []
-        for a, b, c in aspan:
+        for a, b, c in aspans:
             o0, o1 = max(a, s0), min(b, s1)
             if o0 >= o1 or c.fingerprint is None or c.path is None:
                 continue
-            src = c.src_in + (o0 - a) * FLICKS // sr
-            al.append(ALayer(o0 - s0, o1 - o0, src, c.gain_db, c.fingerprint, c.path))
+            speed = Fraction(*c.speed)
+            if c.props.get("reverse"):
+                src = c.src_in + int((b - o1) * speed * FLICKS / sr)
+            else:
+                src = c.src_in + int((o0 - a) * speed * FLICKS / sr)
+            al.append(
+                ALayer(
+                    o0 - s0,
+                    o1 - o0,
+                    src,
+                    c.gain_db,
+                    c.fingerprint,
+                    c.path,
+                    c.speed,
+                    bool(c.props.get("reverse")),
+                )
+            )
         plans.append(ChunkPlan(idx, f0, f1, s0, s1, tuple(vl), tuple(al)))
     return plans
+
+
+def atempo_chain(speed: tuple[int, int]) -> str:
+    return _atempo(speed[0] / speed[1])

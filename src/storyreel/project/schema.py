@@ -1,6 +1,6 @@
 """SQLite schema. Version tracked with PRAGMA user_version; migrations are append-only.
 
-All times are int64 flicks. Phase 2 adds effect/keyframe/transition tables as migration 2.
+All times are int64 flicks.
 """
 
 from __future__ import annotations
@@ -110,6 +110,56 @@ MIGRATIONS: list[str] = [
         created_at REAL NOT NULL,
         last_used_at REAL NOT NULL,
         pinned INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    # 2: Phase 2 compositor: more clip kinds, keyframes, effects, transitions
+    """
+    CREATE TABLE clip_v2 (
+        id INTEGER PRIMARY KEY,
+        track_id INTEGER NOT NULL REFERENCES track(id),
+        kind TEXT NOT NULL CHECK (kind IN ('media', 'color', 'text', 'generator', 'adjust')),
+        asset_id INTEGER REFERENCES asset(id),
+        start INTEGER NOT NULL CHECK (start >= 0),
+        duration INTEGER NOT NULL CHECK (duration > 0),
+        src_in INTEGER NOT NULL DEFAULT 0 CHECK (src_in >= 0),
+        speed_num INTEGER NOT NULL DEFAULT 1,
+        speed_den INTEGER NOT NULL DEFAULT 1,
+        gain_db REAL NOT NULL DEFAULT 0,
+        props TEXT NOT NULL DEFAULT '{}'  -- JSON: transform statics, text, generator, flags
+    );
+    INSERT INTO clip_v2 SELECT * FROM clip;
+    DROP TABLE clip;
+    ALTER TABLE clip_v2 RENAME TO clip;
+    CREATE INDEX clip_track_start ON clip(track_id, start);
+    ALTER TABLE asset ADD COLUMN color_space TEXT;
+    ALTER TABLE asset ADD COLUMN pix_fmt TEXT;
+    CREATE TABLE keyframe (
+        id INTEGER PRIMARY KEY,
+        clip_id INTEGER NOT NULL REFERENCES clip(id),
+        param TEXT NOT NULL,              -- x, y, scale, rotation, opacity, speed, fx<id>.<name>
+        t INTEGER NOT NULL,               -- flicks from clip start
+        value REAL NOT NULL,
+        interp TEXT NOT NULL DEFAULT 'linear' CHECK (interp IN ('hold', 'linear', 'bezier')),
+        h1x REAL NOT NULL DEFAULT 0.42, h1y REAL NOT NULL DEFAULT 0,
+        h2x REAL NOT NULL DEFAULT 0.58, h2y REAL NOT NULL DEFAULT 1,
+        UNIQUE (clip_id, param, t)
+    );
+    CREATE TABLE effect (
+        id INTEGER PRIMARY KEY,
+        clip_id INTEGER NOT NULL REFERENCES clip(id),
+        idx INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        params TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE transition (
+        id INTEGER PRIMARY KEY,
+        clip_a INTEGER NOT NULL REFERENCES clip(id),
+        clip_b INTEGER NOT NULL REFERENCES clip(id),
+        kind TEXT NOT NULL,
+        duration INTEGER NOT NULL CHECK (duration > 0),
+        params TEXT NOT NULL DEFAULT '{}',
+        UNIQUE (clip_a), UNIQUE (clip_b)
     );
     """,
 ]

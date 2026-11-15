@@ -21,7 +21,7 @@ from storyreel.errors import ExitCode, StoryReelError, ToolFailedError, ToolTime
 from storyreel.jobs.limits import spawn
 from storyreel.watchdog import MemState, Watchdog
 
-_OOM_MARKERS = ("Cannot allocate memory", "Out of memory", "out of memory", "malloc")
+_OOM_MARKERS = ("Cannot allocate memory", "Out of memory", "out of memory", "MemoryError")
 
 
 class MemoryPressureError(StoryReelError):

@@ -37,6 +37,8 @@ class MediaInfo:
     has_audio: bool
     sample_rate: int | None
     channels: int | None
+    color_space: str | None = None
+    pix_fmt: str | None = None
 
 
 def fingerprint(path: Path) -> str:
@@ -138,4 +140,6 @@ def probe(ffprobe: Path, path: Path, *, timeout_s: float = 30.0) -> MediaInfo:
         has_audio=a is not None,
         sample_rate=int(a["sample_rate"]) if a and a.get("sample_rate") else None,
         channels=int(a["channels"]) if a and a.get("channels") else None,
+        color_space=(v.get("color_space") or None) if v else None,
+        pix_fmt=(v.get("pix_fmt") or None) if v else None,
     )

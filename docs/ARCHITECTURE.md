@@ -7,6 +7,28 @@ that builds the component. If a measurement contradicts this document, the docum
 
 ---
 
+## 0a. Policy: free, open source, offline (owner requirement, 2026-11-15)
+
+Every default dependency, model and asset source must be free, open source (or open-weight
+with a licence that allows commercial use, since the output goes to a monetised YouTube
+channel), and must run with no internet. Paid APIs are not part of the design. This
+replaces the original "backend A = cloud APIs, default for realism".
+
+| Need | Default (all local) | Excluded, and why |
+|---|---|---|
+| Story/script | llama.cpp + open-weight ~3B model (e.g. Qwen2.5-3B-Instruct, Apache-2.0); rule-based splitter fallback | Cloud LLM APIs (paid) |
+| Voice | Kokoro-82M (Apache-2.0), Piper (MIT); voice licences checked per voice | Cloud TTS (paid); non-commercial voices |
+| Images | SD 1.5 + LCM via OpenVINO on CPU / Intel iGPU (OpenRAIL-M allows commercial use) | SD-Turbo / SDXL-Turbo (non-commercial licence) |
+| Video realism | Stills animated (Ken Burns, parallax, depth 2.5D, environments); free stock downloaded when online, cached | Local video diffusion (needs 8-24 GB VRAM); cloud video gen (paid) |
+| Music / SFX | Procedural generators; user's CC0 / YouTube Audio Library files | MusicGen (CC-BY-NC weights) |
+| Captions / translation | faster-whisper (MIT), Argos Translate (MIT) | NLLB (CC-BY-NC) |
+| Fonts | Noto (OFL), bundled | Relying on OS fonts only |
+| Atmos | Not offered (needs a paid Dolby licence); the exporter hook stays | — |
+
+Honest consequence: photorealistic *moving* AI video cannot be produced free and offline on
+the target laptop. The tool produces animated/motion-graphics and stills-to-motion styles
+offline, and real footage from free stock libraries.
+
 ## 0. Decisions in one screen
 
 | Decision | Choice | Why (numbers) |

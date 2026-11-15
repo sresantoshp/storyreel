@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -20,7 +21,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from storyreel.errors import ExitCode, StoryReelError
+from storyreel.errors import ExitCode, StoryReelError, ToolFailedError
 from storyreel.jobs.runner import JobStats, MemoryPressureError, run_ffmpeg
 from storyreel.proc import run
 from storyreel.project.store import Project
@@ -159,20 +160,32 @@ class Renderer:
             except BaseException:
                 part.unlink(missing_ok=True)
                 raise
+            finally:
+                part.with_name(part.name + ".spec.json").unlink(missing_ok=True)
             _fsync_replace(part, final)
             self.peak_commit = max(self.peak_commit, stats.peak_commit or 0)
             return stats
         raise AssertionError("unreachable")
 
     def _video_argv(self, plan: ChunkPlan, part: Path, low_mem: bool) -> list[str]:
-        return ffgraph.video_argv(self.ffmpeg, plan, self.s, part, low_mem=low_mem)
+        if not plan.path_b:
+            return ffgraph.video_argv(self.ffmpeg, plan, self.s, part, low_mem=low_mem)
+        spec_path = part.with_name(part.name + ".spec.json")
+        spec_path.write_text(
+            json.dumps(worker_spec(plan, self.s, self.ffmpeg, part, low_mem)), encoding="utf-8"
+        )
+        return [sys.executable, "-m", "storyreel.render.worker", str(spec_path)]
 
     def _audio_argv(self, plan: ChunkPlan, part: Path, low_mem: bool) -> list[str]:
         return ffgraph.audio_argv(self.ffmpeg, plan, self.s, part)
 
     # -- main --------------------------------------------------------------------------
     def plan(self) -> list[ChunkPlan]:
-        return plan_chunks(load_timeline(self.p), self.s)
+        warnings: list[str] = []
+        plans = plan_chunks(load_timeline(self.p), self.s, warnings)
+        for w in warnings:
+            self.emit({"event": "warning", "message": w})
+        return plans
 
     def render(self, out: Path) -> RenderSummary:
         t0 = time.monotonic()
@@ -208,6 +221,7 @@ class Renderer:
                             "wall_s": round(st.wall_s, 3),
                             "peak_rss_mb": st.peak_rss >> 20,
                             "fps": round(plan.frames / st.wall_s, 1) if st.wall_s else None,
+                            "path": "B" if plan.path_b else "A",
                         }
                     )
                 else:
@@ -251,7 +265,10 @@ class Renderer:
             self._job_end(job_id, "failed", exc.message)
             if isinstance(exc, MemoryPressureError | RenderError):
                 raise
-            raise RenderError(f"Render failed: {exc.message}", fix=exc.fix) from exc
+            detail = ""
+            if isinstance(exc, ToolFailedError) and exc.stderr_tail.strip():
+                detail = f" ({exc.stderr_tail.strip().splitlines()[-1][:300]})"
+            raise RenderError(f"Render failed: {exc.message}{detail}", fix=exc.fix) from exc
         except BaseException as exc:
             self._job_end(job_id, "failed", repr(exc))
             raise
@@ -317,3 +334,38 @@ class Renderer:
             "UPDATE job SET state = ?, last_error = ?, finished_at = ?, peak_rss = ? WHERE id = ?",
             (state, err, time.time(), peak, job_id),
         )
+
+
+def worker_spec(
+    plan: ChunkPlan, s: RenderSettings, ffmpeg: Path, out: Path, low_mem: bool = False
+) -> dict[str, Any]:
+    return {
+        "settings": {
+            "width": s.width,
+            "height": s.height,
+            "fps_num": s.rate.num,
+            "fps_den": s.rate.den,
+        },
+        "frames": plan.frames,
+        "layers": plan.worker_layers(),
+        "ffmpeg": str(ffmpeg),
+        "encoder_args": ffgraph.rgb_encoder_args(s, low_mem=low_mem),
+        "out": str(out),
+    }
+
+
+def render_frame(project: Project, s: RenderSettings, ffmpeg: Path, frame: int) -> Any:
+    """One timeline frame as uint8 RGB via the compositor (preview / golden tests)."""
+    from dataclasses import replace
+
+    from storyreel.render.compositor import Compositor
+
+    sb = replace(s, force_path_b=True)
+    for plan in plan_chunks(load_timeline(project), sb):
+        if plan.f0 <= frame < plan.f1:
+            comp = Compositor(worker_spec(plan, sb, ffmpeg, Path("unused")), ffmpeg)
+            try:
+                return comp.render(frame - plan.f0)
+            finally:
+                comp.close()
+    raise RenderError(f"Frame {frame} is past the end of the timeline.")
