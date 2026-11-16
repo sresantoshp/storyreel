@@ -50,30 +50,27 @@ _SCRIPTS: list[tuple[str, int, int]] = [
 ]
 _INDIC = {"Deva", "Beng", "Guru", "Gujr", "Orya", "Taml", "Telu", "Knda", "Mlym", "Sinh"}
 
-# Font candidates per script: (file name, ttc index). First one found wins.
+# Font candidates per script: (file name, ttc index). First one found wins. The bundled Noto
+# fonts (assets/fonts, SIL OFL 1.1) come first so text renders the same on every machine
+# and in CI; system fonts are fallbacks for scripts we do not bundle.
 _CANDIDATES: dict[str, list[tuple[str, int]]] = {
-    "Latn": [
-        ("segoeui.ttf", 0),
-        ("arial.ttf", 0),
-        ("DejaVuSans.ttf", 0),
-        ("NotoSans-Regular.ttf", 0),
-        ("Helvetica.ttc", 0),
-    ],
-    "Indic": [
-        ("Nirmala.ttc", 0),
-        ("NotoSansDevanagari-Regular.ttf", 0),
-        ("Mangal.ttf", 0),
-        ("Kohinoor.ttc", 0),
-    ],
-    "Taml": [("Nirmala.ttc", 0), ("NotoSansTamil-Regular.ttf", 0), ("Latha.ttf", 0)],
-    "Telu": [("Nirmala.ttc", 0), ("NotoSansTelugu-Regular.ttf", 0), ("Gautami.ttf", 0)],
-    "Knda": [("Nirmala.ttc", 0), ("NotoSansKannada-Regular.ttf", 0), ("Tunga.ttf", 0)],
-    "Arab": [("arial.ttf", 0), ("segoeui.ttf", 0), ("NotoSansArabic-Regular.ttf", 0)],
-    "Hebr": [("arial.ttf", 0), ("segoeui.ttf", 0), ("NotoSansHebrew-Regular.ttf", 0)],
+    "Latn": [("NotoSans-Regular.ttf", 0), ("segoeui.ttf", 0), ("arial.ttf", 0),
+             ("DejaVuSans.ttf", 0), ("Helvetica.ttc", 0)],
+    "Deva": [("NotoSansDevanagari-Regular.ttf", 0), ("Nirmala.ttc", 0), ("Mangal.ttf", 0)],
+    "Beng": [("NotoSansBengali-Regular.ttf", 0), ("Nirmala.ttc", 0)],
+    "Gujr": [("NotoSansGujarati-Regular.ttf", 0), ("Nirmala.ttc", 0)],
+    "Taml": [("NotoSansTamil-Regular.ttf", 0), ("Nirmala.ttc", 0), ("Latha.ttf", 0)],
+    "Telu": [("NotoSansTelugu-Regular.ttf", 0), ("Nirmala.ttc", 0), ("Gautami.ttf", 0)],
+    "Knda": [("NotoSansKannada-Regular.ttf", 0), ("Nirmala.ttc", 0), ("Tunga.ttf", 0)],
+    "Indic": [("Nirmala.ttc", 0), ("Kohinoor.ttc", 0)],  # Gurmukhi, Odia, Malayalam, Sinhala
+    "Arab": [("NotoSansArabic-Regular.ttf", 0), ("arial.ttf", 0), ("segoeui.ttf", 0)],
+    "Hebr": [("NotoSansHebrew-Regular.ttf", 0), ("arial.ttf", 0), ("segoeui.ttf", 0)],
     "Hani": [("msyh.ttc", 0), ("NotoSansCJK-Regular.ttc", 0)],
     "Hira": [("YuGothR.ttc", 0), ("msgothic.ttc", 0), ("NotoSansCJK-Regular.ttc", 0)],
     "Hang": [("malgun.ttf", 0), ("NotoSansCJK-Regular.ttc", 0)],
-}
+}  # fmt: skip
+
+BUNDLED_FONTS = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 
 class FontNotFoundError(StoryReelError):
@@ -81,6 +78,10 @@ class FontNotFoundError(StoryReelError):
 
 
 def _font_dirs() -> list[Path]:
+    return [BUNDLED_FONTS, *_system_font_dirs()]
+
+
+def _system_font_dirs() -> list[Path]:
     if sys.platform == "win32":
         import os
 

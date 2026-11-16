@@ -156,8 +156,9 @@ needs_indic_font = pytest.mark.skipif(
 @needs_indic_font
 def test_hindi_is_shaped_not_mapped_per_codepoint() -> None:
     line = shaping.shape_line("हिन्दी", 64)
-    # 6 code points shape to 4 glyphs (conjunct न्द, reordered ि matra)
-    assert len(line.glyphs) == 4
+    # 6 code points shape to fewer glyphs: the conjunct न्द is either one stacked ligature
+    # (Nirmala UI: 4 glyphs) or half-न + द (Noto: 5 glyphs); both are correct Hindi.
+    assert len(line.glyphs) < 6
     assert line.glyphs[0].cluster == line.glyphs[1].cluster == 0  # ि sits before ह in cluster 0
 
 
@@ -188,3 +189,16 @@ def test_drifting_mountains_move_and_static_ones_are_cached() -> None:
     assert still.frame(0.0) is still.frame(5.0)  # same cached planes object
     moving = Generator("mountains", {"drift": 40.0}, 160, 90)
     assert not np.array_equal(moving.frame(0.0)[0], moving.frame(2.0)[0])
+
+
+def test_bundled_fonts_win_over_system_fonts() -> None:
+    for script, name in (
+        ("Latn", "NotoSans-Regular.ttf"),
+        ("Deva", "NotoSansDevanagari-Regular.ttf"),
+        ("Taml", "NotoSansTamil-Regular.ttf"),
+        ("Telu", "NotoSansTelugu-Regular.ttf"),
+        ("Knda", "NotoSansKannada-Regular.ttf"),
+        ("Arab", "NotoSansArabic-Regular.ttf"),
+    ):
+        path, _ = shaping.find_font(script)
+        assert path.parent == shaping.BUNDLED_FONTS and path.name == name, (script, path)

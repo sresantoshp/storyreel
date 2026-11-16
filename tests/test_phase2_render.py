@@ -4,7 +4,6 @@ speed/reverse source mapping, transitions, worker renders, and golden frames (SS
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -314,7 +313,7 @@ def test_golden_scene(proj: tuple[store.Project, Editor, list[int]], media: Medi
             "size": 28,
             "outline": 2,
             "anim": "pop",
-            "font": "arial.ttf" if shutil.which("cmd") else "",
+            "font": "NotoSans-Regular.ttf",  # bundled: same pixels on every OS
         },
     )
     GOLDEN.mkdir(exist_ok=True)

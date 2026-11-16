@@ -1,0 +1,59 @@
+# Memory/speed benchmarks that are too heavy for the development laptop.
+# Manual (choose the length) and weekly. Results are uploaded as a build artifact.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      length:
+        description: "Synthetic project length (e.g. 10s, 10min, 2h)"
+        default: "10min"
+      kill_after:
+        description: "kill -9 the render after N chunks, then resume (empty = no kill)"
+        default: "20"
+  schedule:
+    - cron: "17 3 * * 1"  # Mondays 03:17 UTC
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+
+      - name: Install project
+        run: uv sync
+
+      - name: Machine
+        run: |
+          nproc
+          free -m
+          ffmpeg -hide_banner -version | head -1
+
+      - name: Benchmark
+        env:
+          LENGTH: ${{ github.event.inputs.length || '10min' }}
+          KILL_AFTER: ${{ github.event.inputs.kill_after || '20' }}
+        run: |
+          if [ -n "$KILL_AFTER" ]; then
+            uv run python bench/bench_render.py --length "$LENGTH" --kill-after "$KILL_AFTER"
+          else
+            uv run python bench/bench_render.py --length "$LENGTH"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results/
