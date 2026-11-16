@@ -18,19 +18,40 @@ Every frame is a pure function of its inputs, so transitions may straddle chunk 
 from __future__ import annotations
 
 import bisect
+import functools
 import hashlib
 import json
 import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 from storyreel.errors import StoryReelError
 from storyreel.project.store import Project
 from storyreel.timebase import FLICKS, Rate
 
-ENGINE_VERSION = "3"  # bump when render output changes for the same inputs
+ENGINE_VERSION = "3"  # manual bump for changes outside the fingerprinted code (e.g. ffmpeg)
+
+
+@functools.lru_cache(maxsize=1)
+def engine_fingerprint() -> str:
+    """Hash of every source file that decides what a frame looks like.
+
+    Part of every cache key, so editing a generator, effect, text or compositor module
+    invalidates old chunks automatically. A cosmetic edit costs a re-render; a forgotten
+    manual version bump would have served stale video, which is worse.
+    """
+    pkg = Path(__file__).resolve().parent.parent  # src/storyreel
+    h = hashlib.blake2b(ENGINE_VERSION.encode(), digest_size=12)
+    for sub in ("render", "text"):
+        for f in sorted((pkg / sub).glob("*.py")):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
 _HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
 
@@ -154,7 +175,7 @@ class ChunkPlan:
 
     def _key(self, kind: str, settings: dict[str, Any], layers: tuple[Any, ...], n: int) -> str:
         payload = {
-            "engine": ENGINE_VERSION,
+            "engine": engine_fingerprint(),
             "kind": kind,
             "settings": settings,
             "n": n,

@@ -11,3 +11,4 @@ dist/
 bench/.media/
 bench/.work/
 examples/out/
+.claude/

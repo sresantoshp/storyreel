@@ -116,7 +116,19 @@ def test_grain_is_deterministic_per_frame() -> None:
 
 # -- generators --------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "gtype", ["gradient", "starfield", "rain", "snow", "fog", "fire", "particles"]
+    "gtype",
+    [
+        "gradient",
+        "starfield",
+        "rain",
+        "snow",
+        "fog",
+        "fire",
+        "particles",
+        "mountains",
+        "river",
+        "birds",
+    ],
 )
 def test_generators_deterministic_and_well_formed(gtype: str) -> None:
     g1, g2 = Generator(gtype, {}, 160, 90), Generator(gtype, {}, 160, 90)
@@ -131,7 +143,7 @@ def test_generators_deterministic_and_well_formed(gtype: str) -> None:
     r_a, a_a = g1.frame(0.0)
     r_b, a_b = g1.frame(1.0)
     moved = not np.array_equal(r_a, r_b) or (a_a is not None and not np.array_equal(a_a, a_b))
-    assert moved or gtype == "gradient"  # everything animates except a static gradient
+    assert moved or gtype in ("gradient", "mountains")  # static by default (cached)
 
 
 # -- text shaping --------------------------------------------------------------------------
@@ -169,3 +181,10 @@ def test_letter_units_follow_clusters() -> None:
     assert len(block.units) == 3  # spaces are not units
     words = shaping.layout("ab c", 40, by_word=True)
     assert len(words.units) == 2
+
+
+def test_drifting_mountains_move_and_static_ones_are_cached() -> None:
+    still = Generator("mountains", {}, 160, 90)
+    assert still.frame(0.0) is still.frame(5.0)  # same cached planes object
+    moving = Generator("mountains", {"drift": 40.0}, 160, 90)
+    assert not np.array_equal(moving.frame(0.0)[0], moving.frame(2.0)[0])

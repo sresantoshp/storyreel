@@ -89,3 +89,14 @@ def test_key_ignores_file_path_but_not_content() -> None:
     k = plan_chunks(a, s)[0].video_key(s)
     assert plan_chunks(moved, s)[0].video_key(s) == k
     assert plan_chunks(edited, s)[0].video_key(s) != k
+
+
+def test_engine_fingerprint_is_stable_and_in_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from storyreel.render import plan as plan_mod
+
+    s = RenderSettings(640, 360, Rate(30))
+    clips = [_clip(1, 0, 5, "x")]
+    k1 = plan_chunks(clips, s)[0].video_key(s)
+    assert plan_chunks(clips, s)[0].video_key(s) == k1  # deterministic
+    monkeypatch.setattr(plan_mod, "engine_fingerprint", lambda: "changed-code")
+    assert plan_chunks(clips, s)[0].video_key(s) != k1  # code change -> new key

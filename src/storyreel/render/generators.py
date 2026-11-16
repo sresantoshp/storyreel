@@ -1,4 +1,5 @@
-"""Procedural environments: gradient, starfield, rain, snow, fog, fire, particles.
+"""Procedural environments: gradient, starfield, rain, snow, fog, fire, particles,
+and illustrated landscape pieces: mountains, river, birds.
 
 Every generator is a pure function of (clip-local time, params, seed, frame size). No state
 is carried between frames, so any chunk can render any frame independently and results are
@@ -33,9 +34,10 @@ class Generator:
         self.w, self.h = width, height
         self._solid_rgb: np.ndarray | None = None
         self._static: Planes | None = None
+        self._river_geom: tuple[np.ndarray, np.ndarray] = (np.zeros(0), np.zeros(0))
         seed = int(self.p.get("seed", 1))
         rng = np.random.default_rng(seed)
-        n = int(self.p.get("count", 0))
+        n = int(self.p.get("count", self.p.get("ripples", 0)))  # particles per type
         self.u = rng.random((n, 4), dtype=np.float32)  # per-particle uniforms
         if gtype in ("fog", "fire"):
             # Tileable noise octaves; animated by scrolling, upscaled per frame.
@@ -207,3 +209,143 @@ class Generator:
         return self._solid(p["color"]), np.asarray(
             np.clip(a, 0, 1) * float(p["opacity"]), np.float32
         )
+
+    # -- illustrated landscape ---------------------------------------------------------
+    def _ridge(self, layer: int, x: np.ndarray, shift: float) -> np.ndarray:
+        """Periodic 1D fractal ridge in [0, 1] (period 3 frame widths, so drift never seams)."""
+        rng = np.random.default_rng(int(self.p.get("seed", 1)) * 97 + layer)
+        period = 3.0 * self.w
+        y = np.zeros_like(x, dtype=np.float64)
+        amp, total = 1.0, 0.0
+        for octave in range(5):
+            k = int(rng.integers(2, 4)) * (2**octave)  # whole cycles per period: seamless
+            y += amp * np.sin(2 * np.pi * k * (x + shift) / period + rng.uniform(0, 2 * np.pi))
+            total += amp
+            amp *= 0.5
+        return np.asarray((y / total + 1.0) / 2.0)
+
+    @staticmethod
+    def _unpremul(rgb: np.ndarray, a: np.ndarray) -> np.ndarray:
+        """rgb was composited over black; divide out coverage for straight alpha."""
+        return np.asarray(rgb / np.maximum(a, 1e-6)[..., None], np.float32)
+
+    def _mountains(self, t: float) -> Planes:
+        """Layered ridges, far (pale, high) to near (dark, low), drifting with parallax."""
+        p = self.p
+        drift = float(p["drift"])
+        if drift == 0.0 and self._static is not None:
+            return self._static
+        # Static mountains render once at full resolution. Drifting ones re-render every
+        # frame, so they work at half resolution (measured: 400 ms/frame at 1080p otherwise).
+        k_res = 1 if drift == 0.0 else 2
+        w, h = self.w // k_res, self.h // k_res
+        n = max(1, int(p["layers"]))
+        horizon = float(p["horizon"]) * h
+        top = horizon - float(p["height"]) * h
+        far, near = hex_rgb(p["far"]), hex_rgb(p["near"])
+        rgb = np.zeros((h, w, 3), np.float32)
+        a = np.zeros((h, w), np.float32)
+        xs = np.arange(0, w + 8, 8, dtype=np.float64)
+        yy = np.arange(h, dtype=np.float32)[:, None]
+        cols = np.arange(w, dtype=np.float64)
+        white = np.array([0.96, 0.97, 1.0], np.float32)
+        for i in range(n):
+            k = i / max(n - 1, 1)  # 0 = farthest
+            color = far * (1 - k) + near * k
+            peak = top + k * 0.5 * (horizon - top)  # nearer ridges are lower
+            ridge = self._ridge(i, xs * k_res, drift * t * (0.4 + k)) ** 1.6  # sharp peaks
+            ys = peak + (1 - ridge) * (horizon - peak) * 0.92
+            poly = np.concatenate([np.stack([xs, ys], 1), [[w + 8, h], [0, h]]]).astype(np.int32)
+            layer = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(layer, [poly], 255, cv2.LINE_AA)
+            m = layer.astype(np.float32) / 255.0
+            cap = float(p["snowcap"]) * (1 - 0.8 * k)
+            if cap > 0:  # a snow cap under every high peak, deeper on taller peaks
+                yr = np.interp(cols, xs, ys).astype(np.float32)
+                rr = np.interp(cols, xs, ridge).astype(np.float32)
+                depth = cap * (horizon - peak) * np.clip((rr - 0.45) / 0.4, 0, 1)
+                snow = np.clip((yr + depth - yy) / (6.0 / k_res), 0, 1) * (depth > 0.5) * m
+                col = color + (white - color) * snow[..., None]
+            else:
+                col = np.broadcast_to(color, (h, w, 3))
+            rgb = rgb * (1 - m[..., None]) + col * m[..., None]
+            a = np.maximum(a, m)
+        rgb = self._unpremul(rgb, a)
+        if k_res != 1:
+            rgb, a = self._up(rgb), self._up(a)
+        out: Planes = (rgb, np.asarray(a, np.float32))
+        if drift == 0.0:
+            self._static = out
+        return out
+
+    def _river(self, t: float) -> Planes:
+        """Meadow valley floor with a river winding toward the viewer; ripples flow downstream."""
+        p, u = self.p, self.u
+        w, h = self.w, self.h
+        y0 = float(p["horizon"]) * h
+        r0 = int(y0)
+        span = h - y0
+        if self._static is None:  # banks and water body never change: build once
+            rgb = np.zeros((h, w, 3), np.float32)
+            a = np.zeros((h, w), np.float32)
+            ys = np.arange(r0, h, dtype=np.float32)
+            s = np.clip((ys - y0) / span, 0.0, 1.0)  # 0 at the horizon, 1 at the bottom
+            bank = (
+                hex_rgb(p["bank_far"])[None, :] * (1 - s[:, None]) + hex_rgb(p["bank"]) * s[:, None]
+            )
+            rgb[r0:] = bank[:, None, :]
+            a[r0:] = 1.0
+            depth = np.sqrt(s)  # perspective: the near river widens quickly
+            wf, wn = float(p["width_far"]) * w, float(p["width_near"]) * w
+            half = (wf + (wn - wf) * depth**1.8) / 2  # stays narrow, then opens near the viewer
+            # S-shaped course: one full swing between the horizon and the bottom edge
+            cx = w * (0.5 + float(p["meander"]) * np.sin(2 * np.pi * depth + 0.4))
+            water = (hex_rgb(p["water_far"])[None, :] * (1 - depth[:, None])
+                     + hex_rgb(p["water"]) * depth[:, None])  # fmt: skip
+            xx = np.arange(w, dtype=np.float32)[None, :]
+            inside = np.clip(half[:, None] - np.abs(xx - cx[:, None]) + 0.5, 0, 1)[..., None]
+            rgb[r0:] = rgb[r0:] * (1 - inside) + water[:, None, :] * inside
+            self._static = (np.asarray(rgb, np.float32), np.asarray(a, np.float32))
+            self._river_geom = (np.asarray(cx), np.asarray(half))
+        base_rgb, base_a = self._static
+        cx, half = self._river_geom
+        n = len(u)
+        # ripples move along the river over time: downstream = toward the viewer
+        s = (u[:, 1] + float(p["speed"]) * t * (0.7 + 0.6 * u[:, 2])) % 1.0
+        depth = s * s
+        row = np.clip((y0 + depth * span).astype(int) - r0, 0, len(cx) - 1)
+        x = cx[row] + (u[:, 0] - 0.5) * 1.6 * half[row]
+        y = y0 + depth * span
+        length = 4 + 40 * depth * (0.5 + u[:, 3])
+        fade = np.clip(depth * 3, 0, 1) * (0.25 + 0.5 * u[:, 3])
+        ripples = np.zeros((h, w), np.float32)
+        segs = np.stack([x - length / 2, y, x + length / 2, y], 1).astype(np.int32).reshape(n, 2, 2)
+        bucket = np.minimum((fade * 4).astype(int), 2)
+        for b in range(3):  # three brightness buckets: three batched polylines calls
+            sel = bucket == b
+            if sel.any():
+                cv2.polylines(ripples, list(segs[sel]), False, 0.35 + 0.25 * b, 2, cv2.LINE_AA)
+        rgb = base_rgb.copy()
+        kk = np.ascontiguousarray(ripples[r0:])
+        white = np.ones_like(rgb[r0:])
+        rgb[r0:] = cv2.blendLinear(white, np.ascontiguousarray(base_rgb[r0:]), kk, 1.0 - kk)
+        return rgb, base_a
+
+    def _birds(self, t: float) -> Planes:
+        """A loose flock crossing the sky with flapping M-shaped wings."""
+        p, u = self.p, self.u
+        w, h = self.w, self.h
+        size = float(p["size"])
+        span = w + 4 * size
+        x = (u[:, 0] * span + float(p["speed"]) * t * (0.8 + 0.4 * u[:, 2])) % span - 2 * size
+        y = h * (0.1 + 0.25 * u[:, 1]) + 8 * np.sin(t * 0.8 + u[:, 3] * 6.28)
+        s = size * (0.6 + 0.6 * u[:, 2])
+        dy = s * 0.55 * np.sin(t * float(p["flap"]) * 2 * np.pi + u[:, 3] * 6.28)
+        pts = np.stack([
+            np.stack([x - s, y - dy], 1), np.stack([x - 0.35 * s, y - 0.2 * dy], 1),
+            np.stack([x, y + 0.15 * s], 1), np.stack([x + 0.35 * s, y - 0.2 * dy], 1),
+            np.stack([x + s, y - dy], 1),
+        ], 1).astype(np.int32)  # fmt: skip
+        a = np.zeros((h, w), np.float32)
+        cv2.polylines(a, list(pts), False, 1.0, max(2, int(size / 7)), cv2.LINE_AA)
+        return self._solid(p["color"]), a

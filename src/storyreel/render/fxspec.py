@@ -154,6 +154,32 @@ GENERATORS: dict[str, dict[str, Any]] = {
         "opacity": 0.5,
         "seed": 1,
     },
+    # Illustrated landscape pieces; `horizon` (fraction of height) must match between
+    # mountains and river so the valley floor lines up.
+    "mountains": {
+        "layers": 3,
+        "far": "#a7bdd6",
+        "near": "#3e5d4a",
+        "height": 0.42,
+        "horizon": 0.62,
+        "snowcap": 0.22,
+        "drift": 0.0,
+        "seed": 3,
+    },
+    "river": {
+        "horizon": 0.62,
+        "bank_far": "#86a95e",
+        "bank": "#4f7d35",
+        "water_far": "#b4d6ee",
+        "water": "#2f6fa8",
+        "width_far": 0.03,
+        "width_near": 0.5,
+        "meander": 0.12,
+        "speed": 0.12,
+        "ripples": 160,
+        "seed": 2,
+    },
+    "birds": {"count": 7, "size": 26.0, "speed": 90.0, "color": "#1d1d24", "flap": 3.0, "seed": 4},
 }
 
 TEXT_DEFAULTS: dict[str, Any] = {
