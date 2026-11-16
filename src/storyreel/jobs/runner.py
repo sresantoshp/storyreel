@@ -35,6 +35,7 @@ class JobStats:
     wall_s: float
     peak_rss: int  # sampled working set of the child
     peak_commit: int | None  # Job Object peak (Windows only)
+    stderr_tail: str = ""  # only when run with keep_stderr=True
 
 
 def run_ffmpeg(
@@ -45,6 +46,7 @@ def run_ffmpeg(
     heartbeat_s: float = 60.0,
     timeout_s: float = 6 * 3600,
     on_progress: Callable[[dict[str, str]], None] | None = None,
+    keep_stderr: bool = False,
 ) -> JobStats:
     t0 = time.monotonic()
     try:
@@ -58,7 +60,7 @@ def run_ffmpeg(
     except FileNotFoundError as exc:
         raise StoryReelError(f"Could not start {argv[0]}.") from exc
     assert p.stdout is not None and p.stderr is not None
-    err_tail: collections.deque[str] = collections.deque(maxlen=50)
+    err_tail: collections.deque[str] = collections.deque(maxlen=200 if keep_stderr else 50)
     last_beat = [time.monotonic()]
 
     def read_progress() -> None:
@@ -114,7 +116,7 @@ def run_ffmpeg(
         limiter.close()
 
     stderr = "\n".join(err_tail)
-    stats = JobStats(time.monotonic() - t0, peak_rss, peak_commit)
+    stats = JobStats(time.monotonic() - t0, peak_rss, peak_commit, stderr if keep_stderr else "")
     name = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
     if reason == "memory":
         raise MemoryPressureError("Stopped a render step because memory was nearly exhausted.")

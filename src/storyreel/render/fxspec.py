@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from storyreel.audio.spec import KEYFRAMABLE as AUDIO_KEYFRAMABLE
+
 # Clip transform. x/y are pixel offsets of the layer centre from the frame centre.
 TRANSFORM_DEFAULTS: dict[str, float] = {
     "x": 0.0,
@@ -191,8 +193,13 @@ EASINGS: dict[str, tuple[float, float, float, float]] = {
 }
 
 
-def keyframable_param(name: str, effect_types: dict[int, str]) -> bool:
-    """True if `name` is a transform param or fx<id>.<numeric param> of an existing effect."""
+def keyframable_param(name: str, effect_types: dict[int, str], *, audio: bool = False) -> bool:
+    """True if `name` is a transform param or fx<id>.<numeric param> of an existing effect.
+
+    Audio clips: `volume` (dB) and `speed` only; audio effect parameters are static.
+    """
+    if audio:
+        return name in AUDIO_KEYFRAMABLE or name == "speed"
     if name in TRANSFORM_DEFAULTS:
         return True
     if not name.startswith("fx") or "." not in name:

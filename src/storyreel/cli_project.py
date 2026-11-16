@@ -11,6 +11,7 @@ from typing import Any
 
 import psutil
 
+from storyreel.audio import spec as aspec
 from storyreel.errors import ExitCode, StoryReelError
 from storyreel.media import ffbin
 from storyreel.media.importer import import_files
@@ -101,13 +102,19 @@ def cmd_append(a: argparse.Namespace) -> int:
         tracks = {(r["kind"], r["idx"]): r["id"] for r in p.con.execute("SELECT * FROM track")}
         vt = tracks.get(("video", a.video_track))
         at = tracks.get(("audio", a.audio_track))
-        while vt is None:
-            ed.add_track("video")
+        while vt is None or at is None:
+            ed.add_track("video" if vt is None else "audio")
             tracks = {(r["kind"], r["idx"]): r["id"] for r in p.con.execute("SELECT * FROM track")}
             vt = tracks.get(("video", a.video_track))
+            at = tracks.get(("audio", a.audio_track))
+        audio_only = False
+        if not a.color:
+            row = p.con.execute("SELECT has_video FROM asset WHERE id = ?", (a.asset,)).fetchone()
+            audio_only = row is not None and not row["has_video"]
         end = int(
             p.con.execute(
-                "SELECT coalesce(max(start + duration), 0) FROM clip WHERE track_id = ?", (vt,)
+                "SELECT coalesce(max(start + duration), 0) FROM clip WHERE track_id = ?",
+                (at if audio_only else vt,),
             ).fetchone()[0]
         )
         start = seconds_to_flicks(a.at) if a.at is not None else end
@@ -146,7 +153,9 @@ def cmd_info(a: argparse.Namespace) -> int:
     with store.open_project(Path(a.project)) as p:
         _note_recovery(p)
         s = p.settings()
-        print(f"{s.name}: {s.width}x{s.height} @ {s.rate} fps, {s.sample_rate} Hz, {s.channels} ch")
+        lay = aspec.layout(s.channels).name
+        loud = f"{s.target_lufs:g} LUFS / {s.true_peak:g} dBTP" if s.normalize else "no loudness"
+        print(f"{s.name}: {s.width}x{s.height} @ {s.rate} fps, {s.sample_rate} Hz {lay}, {loud}")
         for r in p.con.execute("SELECT * FROM asset ORDER BY id"):
             dur = f"{r['duration'] / FLICKS:9.2f} s" if r["duration"] else "    still  "
             print(f"  asset #{r['id']:<4} {r['kind']:<5} {dur}  {r['status']:<7} {r['name']}")
@@ -156,7 +165,12 @@ def cmd_info(a: argparse.Namespace) -> int:
                 "FROM clip WHERE track_id = ?",
                 (t["id"],),
             ).fetchone()
-            print(f"  track {t['name']:<4} {row['n']:>5} clips, ends at {row['e'] / FLICKS:.2f} s")
+            bus = f"  -> {t['bus']}" if t["kind"] == "audio" else ""
+            mute = "  MUTED" if t["muted"] else ""
+            print(
+                f"  track {t['name']:<4} {row['n']:>5} clips, ends at {row['e'] / FLICKS:.2f} s"
+                f"{bus}{mute}"
+            )
             if a.clips:
                 for c in p.con.execute(
                     "SELECT c.*, a.name AS aname FROM clip c "
@@ -173,11 +187,40 @@ def cmd_info(a: argparse.Namespace) -> int:
                     )
                     speed = c["speed_num"] / c["speed_den"]
                     extra = f" {speed:g}x" if speed != 1 else ""
+                    if t["kind"] == "audio":
+                        extra += _audio_desc(p, c["id"], c["gain_db"], props)
                     print(
                         f"      clip #{c['id']:<5} {c['start'] / FLICKS:8.2f} s +"
                         f"{c['duration'] / FLICKS:7.2f} s  {c['kind']:<9} {what}{extra}"
                     )
+        if a.clips:
+            from storyreel.cli_audio import _print_buses
+
+            _print_buses(p)
     return int(ExitCode.OK)
+
+
+def _audio_desc(p: store.Project, clip_id: int, gain_db: float, props: dict[str, Any]) -> str:
+    parts = [f"gain {gain_db:+.1f} dB"]
+    if props.get("pan"):
+        parts.append(f"pan {props['pan']:+.2f}")
+    if props.get("fade_in") or props.get("fade_out"):
+        parts.append(f"fades {props.get('fade_in', 0):g}/{props.get('fade_out', 0):g} s")
+    keys = p.con.execute(
+        "SELECT t, value FROM keyframe WHERE clip_id = ? AND param = 'volume' ORDER BY t",
+        (clip_id,),
+    ).fetchall()
+    if keys:
+        parts.append("volume " + " ".join(f"{k['t'] / FLICKS:g}s:{k['value']:+g}dB" for k in keys))
+    fx = [
+        f"{e['type']}#{e['id']}"
+        for e in p.con.execute(
+            "SELECT id, type FROM effect WHERE clip_id = ? ORDER BY idx", (clip_id,)
+        )
+    ]
+    if fx:
+        parts.append("fx " + ",".join(fx))
+    return "  [" + "; ".join(parts) + "]"
 
 
 def cmd_render(a: argparse.Namespace) -> int:
@@ -205,6 +248,16 @@ def cmd_render(a: argparse.Namespace) -> int:
             preset=a.preset,
             crf=a.crf,
             chunk_seconds=a.chunk_seconds,
+            acodec=a.acodec,
+            abitrate=a.abitrate or "",
+            target_lufs=(
+                None
+                if a.no_normalize or not (ps.normalize or a.target_lufs is not None)
+                else (a.target_lufs if a.target_lufs is not None else ps.target_lufs)
+            ),
+            true_peak=ps.true_peak,
+            out_channels=aspec.LAYOUT_NAMES[a.downmix] if a.downmix else None,
+            stems=a.stems,
         )
         out = Path(a.output) if a.output else p.renders_dir / f"{ps.name}.mp4"
         wd = Watchdog(cap).start()
@@ -225,6 +278,14 @@ def cmd_render(a: argparse.Namespace) -> int:
             f"dropped {r.frames_expected - r.frames_written}"
         )
         print(f"Wall       {r.wall_s:.1f} s ({r.duration_s / r.wall_s:.2f}x real time)")
+        if r.loudness_i is not None:
+            print(
+                f"Loudness   {r.loudness_i:.1f} LUFS, LRA {r.loudness_lra:.1f} LU, true peak "
+                f"{r.true_peak:.1f} dBTP (gain {r.loudness_gain_db:+.1f} dB, "
+                f"{r.audio_passes} encode pass(es))"
+            )
+        for stem in r.stems:
+            print(f"Stem       {stem}")
         print(
             f"Memory     peak tree RSS {r.peak_tree_rss / MB:.0f} MB, peak job commit "
             f"{d['peak_job_commit'] / MB:.0f} MB, cap {cap / MB:.0f} MB, "
@@ -278,4 +339,10 @@ def register(sub: Any) -> None:
     r.add_argument("--crf", type=int, default=20)
     r.add_argument("--preset", default="veryfast")
     r.add_argument("--json", action="store_true", help="JSON-lines progress events on stdout")
+    r.add_argument("--acodec", default="aac", choices=sorted(aspec.CODECS))
+    r.add_argument("--abitrate", help="e.g. 256k (default depends on codec and channels)")
+    r.add_argument("--downmix", choices=["stereo", "5.1"], help="downmix the final audio")
+    r.add_argument("--stems", choices=["flac", "wav"], help="also write per-bus stems")
+    r.add_argument("--target-lufs", type=float, help="override the project loudness target")
+    r.add_argument("--no-normalize", action="store_true", help="skip loudness normalisation")
     r.set_defaults(func=cmd_render)

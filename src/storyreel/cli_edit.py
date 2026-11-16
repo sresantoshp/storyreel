@@ -245,7 +245,8 @@ def register(sub: Any) -> None:
     k.set_defaults(func=cmd_kenburns)
 
     kf = sub.add_parser(
-        "keyframe", help="animate a parameter: x y scale rotation opacity speed fx<N>.<p>"
+        "keyframe",
+        help="animate a parameter: x y scale rotation opacity speed fx<N>.<p>; audio: volume (dB)",
     )
     kf.add_argument("project")
     kf.add_argument("clip", type=int)
@@ -265,7 +266,8 @@ def register(sub: Any) -> None:
 
     st = sub.add_parser(
         "set",
-        help="set clip properties: x y scale rotation opacity crop_* reverse freeze blend, style",
+        help="set clip properties: x y scale rotation opacity crop_* reverse freeze blend, "
+        "style; audio clips: pan (-1..1) fade_in fade_out (s)",
     )
     st.add_argument("project")
     st.add_argument("clip", type=int)

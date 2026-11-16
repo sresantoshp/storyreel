@@ -3,7 +3,7 @@
 Text-to-video studio for weak laptops (4-8 GB RAM, no discrete GPU). Everything streams
 from disk through ffmpeg; renders are chunked, cached and resumable.
 
-Status: Phase 2 (compositor, effects, text, environments) done. Free, open source, offline. See `docs/ARCHITECTURE.md` and `docs/PROGRESS.md`.
+Status: Phase 3 (audio engine: buses, ducking, effects, loudness, 5.1/7.1, stems) done. Free, open source, offline. See `docs/ARCHITECTURE.md` and `docs/PROGRESS.md`.
 
 ```
 python -m pip install uv
@@ -28,6 +28,7 @@ python -m uv sync
 ```
 
 Demo: `python examples/phase2_demo.py` (18 s animated scene, CLI only, offline).
+Audio demo: `python examples/phase3_audio_demo.py` (60 s 4-track mix to -14 LUFS with stems).
 
 Benchmarks: `python bench/bench_render.py --length 10min --kill-after 20`.
 
