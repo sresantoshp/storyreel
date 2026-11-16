@@ -20,6 +20,7 @@ from types import TracebackType
 
 import psutil
 
+from storyreel.audio.spec import LOUDNESS_DEFAULTS
 from storyreel.errors import StoryReelError
 from storyreel.project.schema import MIGRATIONS, SCHEMA_VERSION
 from storyreel.timebase import Rate
@@ -38,6 +39,9 @@ class ProjectSettings:
     rate: Rate
     sample_rate: int = 48_000
     channels: int = 2
+    target_lufs: float = -14.0  # loudness target of the final mix (YouTube); -23 broadcast
+    true_peak: float = -1.0  # dBTP ceiling
+    normalize: bool = True  # two-pass loudness normalisation in the final encode
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,7 @@ class Project:
     # -- settings ----------------------------------------------------------------------
     def settings(self) -> ProjectSettings:
         r = self.con.execute("SELECT * FROM project WHERE id = 1").fetchone()
+        audio = {**LOUDNESS_DEFAULTS, **json.loads(r["audio"])}
         return ProjectSettings(
             r["name"],
             r["width"],
@@ -125,6 +130,9 @@ class Project:
             Rate(r["fps_num"], r["fps_den"]),
             r["sample_rate"],
             r["channels"],
+            float(audio["target_lufs"]),
+            float(audio["true_peak"]),
+            bool(audio["normalize"]),
         )
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -203,8 +211,13 @@ def create(root: Path, settings: ProjectSettings) -> Project:
     _acquire_lock(root)
     con = connect(root / DB_NAME)
     _migrate(con)
+    audio = {
+        "target_lufs": settings.target_lufs,
+        "true_peak": settings.true_peak,
+        "normalize": settings.normalize,
+    }
     con.execute(
-        "INSERT INTO project VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO project VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             settings.name,
             settings.width,
@@ -214,6 +227,7 @@ def create(root: Path, settings: ProjectSettings) -> Project:
             settings.sample_rate,
             settings.channels,
             time.time(),
+            json.dumps(audio),
         ),
     )
     con.execute("INSERT INTO track(kind, idx, name) VALUES ('video', 0, 'V1'), ('audio', 0, 'A1')")

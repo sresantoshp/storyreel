@@ -1,5 +1,92 @@
 # Progress
 
+## 2026-11-16 — Phase 3: audio engine
+
+Design and the parts that differ from the first draft: ARCHITECTURE.md §3a.
+
+### Works
+- **Buses**: every audio track routes to dialogue / music / fx / ambience; master = their
+  sum. Per-bus gain, mute, effect chain; master gain + effect chain. Schema migration 3
+  (`track.bus`, `bus`, `bus_effect`, `project.audio`); old projects migrate in place.
+- **Per clip**: gain, balance pan, fade in/out (half-cosine), `volume` keyframes in dB
+  (hold / linear / bezier, same keyframe table and easings as video), audio effect chain.
+- **Effects** (ffmpeg filters, all offline): parametric EQ band (stackable), high/low-pass,
+  compressor, limiter, de-esser, noise reduction (`afftdn`), reverb = `afir` convolution
+  with procedurally generated impulse responses (small_room, hall, cathedral, cave; synthetic,
+  not measured rooms).
+- **Ducking**: music / ambience (and fx if enabled) duck under dialogue clips by a
+  deterministic, look-ahead gain envelope (default −12 dB, 0.25 s attack before the line,
+  0.6 s release), computed by numpy per chunk window, applied with `amultiply`.
+- **Chunk safety**: chunks with effects render from a pre-roll (2 s + longest reverb tail)
+  and trim it; all automation is a pure function of timeline position.
+- **Loudness**: two-pass. `ebur128` measures the concatenated master PCM; the final encode
+  applies the gain and (only if needed) a 4x-oversampled lookahead limiter; the output is
+  measured again and re-encoded with corrections if it misses (≤ 3 encodes). Target −14
+  LUFS (YouTube), `broadcast` −23, any value −36..−5; true peak ≤ −1 dBTP by default.
+- **Layouts / codecs**: stereo, 5.1, 7.1 projects; mono → FC and stereo → FL/FR (no fake
+  upmix); downmix to stereo (or 7.1 → 5.1) in the final encode; AAC, AC-3, E-AC-3, Opus,
+  FLAC; impossible combinations (e.g. AC-3 7.1) fail before any chunk renders.
+- **Stems**: per-bus FLAC (24-bit) or float WAV, same gain as the master, sample-aligned.
+- **Test audio**: `storyreel gen-audio speech|music|ambience|fx` (ffmpeg lavfi only).
+- **CLI**: `loudness <file> [--json]`, `track <p> A2 bus=music`, `bus <p> music gain_db=-3
+  duck_db=-14`, `afx <p> <clip|bus> <type> k=v` / `--remove N`, `audio <p> layout=5.1
+  target_lufs=broadcast`, `set <p> <clip> pan=.. fade_in=.. fade_out=..`, `keyframe <p>
+  <clip> volume <t> <dB>`; `render --acodec --abitrate --downmix --stems --target-lufs
+  --no-normalize`; `info --clips` shows bus routing, clip gain/pan/fades/volume keys/effects,
+  bus settings and chains. `examples/phase3_audio_demo.py` builds a 4-track mix with CLI
+  calls only. Every edit is one undoable command.
+- 115 tests (94 before + 21): loudness ±0.5 LU and TP ≤ −1 dBTP checked by an independent
+  `ebur128` pass (AAC −14, Opus −23), ducking depth, chunked-vs-single continuity with a
+  negative control, stems sum vs master, 5.1 channel routing + downmix to AC-3 stereo,
+  codec/layout refusal, CLI end to end, envelope chunk-invariance, IR, migration, undo.
+  ruff, ruff format, mypy --strict clean.
+
+### Measured (same laptop, another render running concurrently, ~0.5-1 GB RAM free)
+
+| Test | Result |
+|---|---|
+| 60 s, 4 audio tracks (3 dialogue lines with HP+denoise+de-esser+compressor, music with fades + bus EQ + ducking, ambience with volume keyframes, fx panned + hall reverb, dialogue bus small-room reverb, master compressor), stereo AAC, 320x180 video | **render 9.2 s wall** (CLI incl. start-up): 8 audio chunks 3.4 s (each 10 s chunk + 4.0 s pre-roll), video 0.55 s, loudness pass 1 0.23 s, encode with limiter 1.2 s, then verify + 4 FLAC stems |
+| same, memory | **peak tree RSS 106 MB**; largest audio-chunk ffmpeg 64 MB |
+| same, output | **−14.1 LUFS, true peak −1.5 dBTP**, LRA 6.7 LU, gain +8.3 dB, 1 encode |
+| re-render unchanged | 100 % cache hits, 1.5 s |
+| 30 s 5.1 E-AC-3 | −14.1 LUFS, −1.5 dBTP, 1 encode; peak tree RSS 132 MB |
+| 15 s 7.1: Opus / FLAC / AAC / AAC downmixed to stereo | −14.1 LUFS each; TP −1.4 / −1.1 / −1.5 / −1.5 dBTP; 1 / 1 / 2 / 1 encodes |
+| worst case seen: 7.1 with 4 reverbs (cathedral, cave, hall, small room) | 6.4 s pre-roll; 218 MB per audio-chunk ffmpeg (8-channel 4.4 s IRs in `afir`) |
+| chunk continuity, 1 s chunks vs one chunk (compressor, de-esser, EQ, reverb, fades, keyframes) | max error ≤ 3e-8 (float rounding) |
+| same, streams through `afftdn` | max error 2.2e-4 = −57 dB (master) / −51 dB (ambience) of peak, correlation > 0.9999 |
+| same chunks **without** pre-roll (negative control) | max error 0.02-0.04 (−8 to −12 dB of peak): audible clicks |
+| ducking, steady tone under one dialogue clip | −12.0 dB ± 0.1 (test tolerance), ramp starts before the line |
+| stems summed vs 24-bit FLAC master (no limiter engaged) | residual < −60 dB of master |
+
+### Honest limits
+- `afftdn` is not chunk-exact (its adaptive noise estimate depends on where it started);
+  the boundary difference is ~−50 dB of peak, measured above. Everything else matches to float rounding.
+- Ducking follows dialogue *clip spans*, not detected speech: pauses inside a long dialogue
+  clip do not release the duck. Split the clip, or use a shallower `duck_db`.
+- Only `volume` is keyframable on audio. Pan and audio-effect parameters are static.
+  Audio of frozen clips and speed *ramps* is still muted (constant speed and reverse work).
+- The true-peak limiter is `alimiter` on a 4x-oversampled signal (a close approximation,
+  not an ITU-certified true-peak limiter). Lossy encoders overshoot it (AAC: +2.3 dB on a
+  heavily limited test signal; up to 0.4 dB on the demo mixes); the measure-and-re-encode
+  loop is what guarantees TP ≤ −1 dBTP. Each extra encode re-muxes the video by stream
+  copy (cheap, but a full pass over the file).
+- Reverb impulse responses are synthetic: they model RT60, pre-delay and early reflections
+  of a room of that size; they are not recordings of real spaces and have not been judged
+  in listening tests. Long reverbs make every chunk render up to ~6.5 s of pre-roll.
+- AC-3 / E-AC-3 stop at 5.1 (encoder limit); ffmpeg labels E-AC-3 5.1 as `5.1(side)`.
+- Stems are post bus-fx/ducking, pre master-fx: with master effects or when the limiter
+  engages they do not sum exactly to the master. FLAC stems are 24-bit integer and would
+  clip above 0 dBFS after a large gain; WAV stems are float.
+- Any bus change re-renders every audio chunk (bus settings are in every audio key);
+  audio chunks cost ~0.4 s per 10 s.
+- No level meters yet (UI phase); `storyreel loudness` reports integrated loudness, LRA and
+  true peak only (no momentary/short-term maxima).
+- Measured on Windows only. Benchmarks over 60 s (10 min / 2 h) not re-run this phase
+  (RAM was shared with another render); audio memory per chunk does not grow with length.
+
+### Next: Phase 4 (story-to-video pipeline)
+Offline story engine, TTS (Piper/Kokoro) on the dialogue bus, auto-assembly, captions.
+
 ## 2026-11-15 — Phase 2: compositor, effects, text, environments
 
 Owner requirements recorded this phase: (1) the output is for a YouTube channel (Shorts +

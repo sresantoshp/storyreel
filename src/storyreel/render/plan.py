@@ -28,24 +28,26 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from storyreel.audio import spec as aspec
 from storyreel.errors import StoryReelError
 from storyreel.project.store import Project
 from storyreel.timebase import FLICKS, Rate
 
 ENGINE_VERSION = "3"  # manual bump for changes outside the fingerprinted code (e.g. ffmpeg)
+AUDIO_VERSION = "1"  # Phase 3 audio graph (buses, automation, effects, pre-roll)
 
 
 @functools.lru_cache(maxsize=1)
 def engine_fingerprint() -> str:
-    """Hash of every source file that decides what a frame looks like.
+    """Hash of every source file that decides what a frame or a sample looks like.
 
-    Part of every cache key, so editing a generator, effect, text or compositor module
-    invalidates old chunks automatically. A cosmetic edit costs a re-render; a forgotten
-    manual version bump would have served stale video, which is worse.
+    Part of every cache key, so editing a generator, effect, text, audio or compositor
+    module invalidates old chunks automatically. A cosmetic edit costs a re-render; a
+    forgotten manual version bump would have served stale output, which is worse.
     """
     pkg = Path(__file__).resolve().parent.parent  # src/storyreel
     h = hashlib.blake2b(ENGINE_VERSION.encode(), digest_size=12)
-    for sub in ("render", "text"):
+    for sub in ("render", "text", "audio"):
         for f in sorted((pkg / sub).glob("*.py")):
             h.update(f.name.encode())
             h.update(f.read_bytes())
@@ -66,10 +68,14 @@ class RenderSettings:
     preset: str = "veryfast"
     crf: int = 20
     pix_fmt: str = "yuv420p"
-    acodec: str = "aac"
-    abitrate: str = "192k"
+    acodec: str = "aac"  # aac | ac3 | eac3 | opus | flac (audio.spec.CODECS)
+    abitrate: str = ""  # "" = codec default for the channel count
     chunk_seconds: float = 10.0
     force_path_b: bool = False  # tests: render simple chunks through the compositor too
+    target_lufs: float | None = -14.0  # None = no loudness normalisation
+    true_peak: float = -1.0  # dBTP ceiling of the final encode
+    out_channels: int | None = None  # downmix the final encode (e.g. 5.1 project -> 2)
+    stems: str | None = None  # "flac" | "wav": per-bus stems next to the output
 
     @property
     def chunk_frames(self) -> int:
@@ -111,6 +117,7 @@ class TimelineClip:
     asset: dict[str, Any] = field(default_factory=dict)
     trans_in: dict[str, Any] | None = None  # this clip is B of a transition
     trans_out: dict[str, Any] | None = None  # this clip is A of a transition
+    bus: str = "dialogue"  # audio track bus
 
     @property
     def simple(self) -> bool:
@@ -149,6 +156,11 @@ class ALayer:
     path: str = field(default="", compare=False)
     speed: tuple[int, int] = (1, 1)
     reverse: bool = False
+    bus: str = "dialogue"
+    pan: float = 0.0
+    env: str = ""  # canonical JSON gain automation (clip-relative), "" = none
+    effects: str = ""  # canonical JSON effect list, "" = none
+    src_ch: int = 0  # source channel count (0 = unknown): mono → FC, stereo → FL/FR in 5.1+
 
 
 @dataclass(frozen=True)
@@ -159,7 +171,9 @@ class ChunkPlan:
     s0: int
     s1: int
     vlayers: tuple[VLayer, ...]  # bottom to top
-    alayers: tuple[ALayer, ...]
+    alayers: tuple[ALayer, ...]  # `at` is relative to the audio window start (s0 - preroll)
+    preroll: int = 0  # audio samples rendered before s0 and trimmed (warm filter state)
+    mix: str = ""  # canonical JSON: bus config + dialogue intervals (window-relative)
 
     @property
     def frames(self) -> int:
@@ -173,14 +187,23 @@ class ChunkPlan:
     def path_b(self) -> bool:
         return any(layer.extra for layer in self.vlayers)
 
-    def _key(self, kind: str, settings: dict[str, Any], layers: tuple[Any, ...], n: int) -> str:
-        payload = {
+    def _key(
+        self,
+        kind: str,
+        settings: dict[str, Any],
+        layers: tuple[Any, ...],
+        n: int,
+        extra: dict[str, Any] | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
             "engine": engine_fingerprint(),
             "kind": kind,
             "settings": settings,
             "n": n,
             "layers": [{k: v for k, v in asdict(layer).items() if k != "path"} for layer in layers],
         }
+        if extra:
+            payload["extra"] = extra
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.blake2b(blob, digest_size=20).hexdigest()
 
@@ -188,7 +211,8 @@ class ChunkPlan:
         return self._key("v", s.video_key(), self.vlayers, self.frames)
 
     def audio_key(self, s: RenderSettings) -> str:
-        return self._key("a", s.audio_key(), self.alayers, self.samples)
+        extra = {"audio": AUDIO_VERSION, "preroll": self.preroll, "mix": self.mix}
+        return self._key("a", s.audio_key(), self.alayers, self.samples, extra)
 
     def worker_layers(self) -> list[dict[str, Any]]:
         """Layer specs for the path-B worker (paths included)."""
@@ -246,10 +270,11 @@ def load_timeline(project: Project) -> list[TimelineClip]:
         t_in[t["clip_b"]] = row
 
     rows = con.execute(
-        """SELECT c.id, t.kind AS tkind, t.idx, c.kind, c.start, c.duration, c.src_in,
+        """SELECT c.id, t.kind AS tkind, t.idx, t.bus, c.kind, c.start, c.duration, c.src_in,
                   c.speed_num, c.speed_den, c.gain_db, c.props,
                   a.kind AS akind, a.path, a.fingerprint, a.status, a.name, a.width, a.height,
-                  a.fps_num, a.fps_den, a.duration AS adur, a.color_space, a.pix_fmt
+                  a.fps_num, a.fps_den, a.duration AS adur, a.color_space, a.pix_fmt,
+                  a.channels AS achannels
            FROM clip c JOIN track t ON t.id = c.track_id
            LEFT JOIN asset a ON a.id = c.asset_id
            WHERE t.muted = 0
@@ -285,6 +310,7 @@ def load_timeline(project: Project) -> list[TimelineClip]:
                 "duration": r["adur"],
                 "color_space": r["color_space"],
                 "pix_fmt": r["pix_fmt"],
+                "channels": r["achannels"],
             }
             if r["akind"]
             else {}
@@ -310,9 +336,32 @@ def load_timeline(project: Project) -> list[TimelineClip]:
                 asset,
                 t_in.get(r["id"]),
                 t_out.get(r["id"]),
+                r["bus"],
             )
         )
     return out
+
+
+def load_mix(project: Project) -> dict[str, Any]:
+    """Bus settings and bus effect chains: {"buses": {name: {...}}}."""
+    con = project.con
+    buses: dict[str, dict[str, Any]] = {}
+    for r in con.execute("SELECT * FROM bus"):
+        params = {**aspec.BUS_PARAMS, **json.loads(r["params"])}
+        fx = [
+            {"type": e["type"], "params": {**aspec.EFFECTS[e["type"]], **json.loads(e["params"])}}
+            for e in con.execute(
+                "SELECT * FROM bus_effect WHERE bus_id = ? AND enabled = 1 ORDER BY idx",
+                (r["id"],),
+            )
+        ]
+        buses[r["name"]] = {
+            "gain_db": float(r["gain_db"]),
+            "muted": bool(r["muted"]),
+            "fx": fx,
+            **params,
+        }
+    return {"buses": buses}
 
 
 def _sample_of(t: int, sr: int) -> int:
@@ -412,9 +461,43 @@ def _atempo(speed: float) -> str:
     return ",".join(parts)
 
 
+def _audio_env(c: TimelineClip, a: int, b: int, o0: int, sr: int) -> str:
+    fi = round(float(c.props.get("fade_in", 0.0)) * sr)
+    fo = round(float(c.props.get("fade_out", 0.0)) * sr)
+    keys = c.keyframes.get("volume", [])
+    if not (fi or fo or keys):
+        return ""
+    return _canon({"off": o0 - a, "len": b - a, "fi": fi, "fo": fo, "kf": keys})
+
+
+def _audio_effects(c: TimelineClip) -> str:
+    fx = [
+        {"type": e["type"], "params": {**aspec.EFFECTS[e["type"]], **e["params"]}}
+        for e in c.effects
+        if e["type"] in aspec.EFFECTS
+    ]
+    return _canon(fx) if fx else ""
+
+
+def preroll_seconds(aclips: list[TimelineClip], mix: dict[str, Any] | None) -> float:
+    """0 when no audio effect is used anywhere; else warm-up + the longest reverb tail."""
+    fx: list[dict[str, Any]] = [e for c in aclips for e in c.effects if e["type"] in aspec.EFFECTS]
+    if mix:
+        fx += [e for cfg in mix["buses"].values() for e in cfg["fx"]]
+    if not fx:
+        return 0.0
+    tails = [aspec.reverb_tail_s(str(e["params"].get("room", "hall"))) for e in fx
+             if e["type"] == "reverb"]  # fmt: skip
+    return aspec.WARMUP_S + max(tails, default=0.0)
+
+
 def plan_chunks(
-    clips: list[TimelineClip], s: RenderSettings, warnings: list[str] | None = None
+    clips: list[TimelineClip],
+    s: RenderSettings,
+    warnings: list[str] | None = None,
+    mix: dict[str, Any] | None = None,
 ) -> list[ChunkPlan]:
+    """`mix` = load_mix(project); None = all buses at unity, no effects, no ducking."""
     rate, sr = s.rate, s.sample_rate
     vclips = [c for c in clips if c.track_kind == "video"]
     aclips = [c for c in clips if c.track_kind == "audio"]
@@ -437,6 +520,14 @@ def plan_chunks(
                 )
             continue
         aspans.append((_sample_of(c.start, sr), _sample_of(c.start + c.duration, sr), c))
+    buses = (mix or {}).get("buses", {})
+    muted = {name for name, cfg in buses.items() if cfg.get("muted")}
+    aspans = [sp for sp in aspans if sp[2].bus not in muted]
+    pre = round(preroll_seconds([sp[2] for sp in aspans], mix) * sr)
+    speech = sorted((a, b) for a, b, c in aspans if c.bus == "dialogue")
+    ducking = [cfg for name, cfg in buses.items() if cfg.get("duck") and name != "dialogue"]
+    margin_before = round(max((float(c["duck_attack"]) for c in ducking), default=0.0) * sr)
+    margin_after = round(max((float(c["duck_release"]) for c in ducking), default=0.0) * sr)
 
     plans: list[ChunkPlan] = []
     for idx, (f0, f1) in enumerate(chunk_bounds(edits, total, s.chunk_frames)):
@@ -453,9 +544,10 @@ def plan_chunks(
                 if max(sp.lo, f0) < min(sp.hi, f1)
             ]
         s0, s1 = rate.frame_to_sample(f0, sr), rate.frame_to_sample(f1, sr)
+        w0 = max(0, s0 - pre)
         al: list[ALayer] = []
         for a, b, c in aspans:
-            o0, o1 = max(a, s0), min(b, s1)
+            o0, o1 = max(a, w0), min(b, s1)
             if o0 >= o1 or c.fingerprint is None or c.path is None:
                 continue
             speed = Fraction(*c.speed)
@@ -465,7 +557,7 @@ def plan_chunks(
                 src = c.src_in + int((o0 - a) * speed * FLICKS / sr)
             al.append(
                 ALayer(
-                    o0 - s0,
+                    o0 - w0,
                     o1 - o0,
                     src,
                     c.gain_db,
@@ -473,9 +565,22 @@ def plan_chunks(
                     c.path,
                     c.speed,
                     bool(c.props.get("reverse")),
+                    c.bus,
+                    float(c.props.get("pan", 0.0)),
+                    _audio_env(c, a, b, o0, sr),
+                    _audio_effects(c),
+                    int(c.asset.get("channels") or 0),
                 )
             )
-        plans.append(ChunkPlan(idx, f0, f1, s0, s1, tuple(vl), tuple(al)))
+        mix_json = ""
+        if mix is not None:
+            near = [
+                [a - w0, b - w0]
+                for a, b in speech
+                if b + margin_after > w0 and a - margin_before < s1
+            ]
+            mix_json = _canon({"buses": buses, "speech": near if ducking else []})
+        plans.append(ChunkPlan(idx, f0, f1, s0, s1, tuple(vl), tuple(al), s0 - w0, mix_json))
     return plans
 
 

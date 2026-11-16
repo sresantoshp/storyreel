@@ -4,16 +4,16 @@ Video path A: black base + one input per layer, each normalised (fps, fit-scale 
 explicit YUV matrix → BT.709, pad, yuv420p), delayed to its position, overlaid bottom-to-top.
 Video path B: the worker (render/worker.py) encodes compositor output with the same
 `encoder_args`, so chunks from both paths concatenate with `-c copy` and match in colour.
-Audio: silent base + one input per layer: resample, [reverse], [atempo], trim, gain,
-sample-exact delay, mix without normalisation, pad/trim to exactly `samples`, f32 PCM.
+Audio chunks are built by storyreel.audio.graph; the mux here applies the final audio
+filter (downmix, loudness gain, true-peak limiter) and the one lossy encode.
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
-from storyreel.render.plan import ChunkPlan, RenderSettings, atempo_chain
+from storyreel.audio import spec as aspec
+from storyreel.render.plan import ChunkPlan, RenderSettings
 from storyreel.timebase import sec_str
 
 COMMON = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-nostats", "-progress", "pipe:1"]
@@ -27,14 +27,6 @@ COLOR_TAGS = [
     "-color_range",
     "tv",
 ]
-
-
-def _layout(channels: int) -> str:
-    if channels == 1:
-        return "mono"
-    if channels == 2:
-        return "stereo"
-    raise ValueError("Phase 2 renders mono or stereo; 5.1/7.1 arrive with the Phase 3 audio engine")
 
 
 def encoder_args(s: RenderSettings, *, low_mem: bool = False) -> list[str]:
@@ -112,59 +104,6 @@ def video_argv(
     return argv
 
 
-def audio_argv(ffmpeg: Path, plan: ChunkPlan, s: RenderSettings, out: Path) -> list[str]:
-    sr, n, layout = s.sample_rate, plan.samples, _layout(s.channels)
-    argv = [
-        str(ffmpeg),
-        *COMMON,
-        "-f",
-        "lavfi",
-        "-i",
-        f"anullsrc=r={sr}:cl={layout}:d={n / sr + 0.05:.6f}",
-    ]
-    chains: list[str] = []
-    for i, layer in enumerate(plan.alayers, start=1):
-        speed = layer.speed[0] / layer.speed[1]
-        src_samples = math.ceil(layer.samples * speed)
-        in_dur = f"{src_samples / sr + 0.05:.6f}"
-        argv += ["-ss", sec_str(layer.src_in), "-t", in_dur, "-i", str(layer.path)]
-        steps = [
-            f"aresample={sr}",
-            f"aformat=sample_fmts=fltp:channel_layouts={layout}",
-            "asetpts=PTS-STARTPTS",
-            f"atrim=end_sample={src_samples}",
-        ]
-        if layer.reverse:
-            steps.append("areverse")  # bounded: one chunk (<= 10 s) of audio
-        tempo = atempo_chain(layer.speed)
-        if tempo:
-            steps.append(tempo)
-        steps += [
-            f"apad=whole_len={layer.samples}",
-            f"atrim=end_sample={layer.samples}",
-            f"volume={layer.gain_db:.3f}dB",
-            f"adelay=delays={layer.at}S:all=1",
-        ]
-        chains.append(f"[{i}:a]" + ",".join(steps) + f"[a{i}]")
-    inputs = "".join(f"[{x}]" for x in ["0:a", *(f"a{i}" for i in range(1, len(plan.alayers) + 1))])
-    chains.append(
-        f"{inputs}amix=inputs={len(plan.alayers) + 1}:duration=first:normalize=0,"
-        f"apad=whole_len={n},atrim=end_sample={n}[aout]"
-    )
-    argv += [
-        "-filter_complex",
-        ";".join(chains),
-        "-map",
-        "[aout]",
-        "-c:a",
-        "pcm_f32le",
-        "-f",
-        "matroska",
-        str(out),
-    ]
-    return argv
-
-
 def concat_list(entries: list[tuple[Path, float]]) -> str:
     """ffmpeg concat-demuxer script with exact per-file durations."""
     lines = ["ffconcat version 1.0"]
@@ -174,8 +113,39 @@ def concat_list(entries: list[tuple[Path, float]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def mux_argv(ffmpeg: Path, vlist: Path, alist: Path, s: RenderSettings, out: Path) -> list[str]:
-    return [
+def container(out: Path) -> str:
+    return {".mkv": "matroska", ".mov": "mov", ".webm": "webm"}.get(out.suffix.lower(), "mp4")
+
+
+def audio_codec_args(s: RenderSettings, channels: int) -> list[str]:
+    codec = aspec.CODECS[s.acodec]
+    args = ["-c:a", codec.encoder]
+    bitrate = s.abitrate or codec.bitrate.get(channels, "")
+    if codec.lossy and bitrate:
+        args += ["-b:a", bitrate]
+    if s.acodec == "opus":
+        args += ["-ar", "48000"]  # Opus runs at 48 kHz only
+        if channels > 2:
+            args += ["-mapping_family", "1"]
+    else:
+        args += ["-ar", str(s.sample_rate)]
+    if s.acodec == "flac":
+        args += ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
+    return args
+
+
+def mux_argv(
+    ffmpeg: Path,
+    vlist: Path,
+    alist: Path,
+    s: RenderSettings,
+    out: Path,
+    *,
+    audio_filter: str = "",
+    channels: int | None = None,
+) -> list[str]:
+    fmt = container(out)
+    argv = [
         str(ffmpeg),
         *COMMON,
         "-f",
@@ -196,15 +166,38 @@ def mux_argv(ffmpeg: Path, vlist: Path, alist: Path, s: RenderSettings, out: Pat
         "1:a:0",
         "-c:v",
         "copy",
-        "-c:a",
-        s.acodec,
-        "-b:a",
-        s.abitrate,
-        "-ar",
-        str(s.sample_rate),
-        "-movflags",
-        "+faststart",
+    ]
+    if audio_filter:
+        argv += ["-af", audio_filter]
+    argv += audio_codec_args(s, channels or s.channels)
+    if fmt == "mp4":
+        argv += ["-movflags", "+faststart"]
+    argv += ["-f", fmt, str(out)]
+    return argv
+
+
+def stem_argv(
+    ffmpeg: Path, alist: Path, stream: int, gain_db: float, fmt: str, out: Path
+) -> list[str]:
+    """One bus stem from the chunk PCM: same gain as the master, no limiter."""
+    codec = (
+        ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", "-f", "flac"]
+        if fmt == "flac"
+        else ["-c:a", "pcm_f32le", "-f", "wav"]
+    )
+    return [
+        str(ffmpeg),
+        *COMMON,
         "-f",
-        "mp4",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(alist),
+        "-map",
+        f"0:a:{stream}",
+        "-af",
+        f"volume={gain_db:.3f}dB",
+        *codec,
         str(out),
     ]

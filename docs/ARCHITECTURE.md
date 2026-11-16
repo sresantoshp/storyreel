@@ -1,6 +1,7 @@
 # StoryReel Architecture
 
-Status: draft for review (2026-11-15). Nothing below Phase 1 is implemented yet.
+Status: Phases 1-3 implemented (2026-11-16). Sections marked "as built" or
+"implemented" describe the code; the rest is still the plan.
 Numbers marked **measured** were taken on the dev machine (Windows 11, Intel UHD iGPU,
 Python 3.13). Numbers marked **estimate** must be replaced by measurements in the phase
 that builds the component. If a measurement contradicts this document, the document changes.
@@ -127,7 +128,11 @@ asset_fts       FTS5 over (name, tags, license, source_url, description)
 proxy(asset_id, kind[video540|video360|peaks|thumbs], path, params_hash, status)
 sequence(id, name, is_main)                   nested sequences = compound clips
 track(id, sequence_id, kind[video|audio|text|subtitle|adjust], idx, name,
-      muted, locked, solo, bus[dialogue|music|fx|ambience|master])
+      muted, locked, solo, bus[dialogue|music|fx|ambience])   master = sum of the four
+bus(id, name[dialogue|music|fx|ambience|master], gain_db, muted,
+    params_json{duck, duck_db, duck_attack, duck_release})      Phase 3
+bus_effect(id, bus_id, idx, type, params_json, enabled)          Phase 3
+project.audio_json{target_lufs, true_peak, normalize}; project.channels = layout (1/2/6/8)
 clip(id, track_id, kind[media|text|shape|color|sequence|adjust|generator],
      asset_id NULL, ref_sequence_id NULL, start, duration, src_in,
      speed_num, speed_den, reverse, props_json)
@@ -208,12 +213,14 @@ Rate control: CRF/CQP per chunk gives uniform quality. Target-bitrate and two-pa
 per chunk too, so bitrate varies a little at boundaries. Trade-off accepted; users who need
 a strict file size get a "final single-pass re-encode" option (slower, still streaming).
 
-**Audio.** Per chunk: ffmpeg mixes bus graphs (`amix`, `volume` envelopes, `sidechaincompress`,
-EQ, reverb) into 32-bit float PCM. Chunks are concatenated as PCM (sample-exact), loudness is
-measured once over the full file (`ebur128`/`loudnorm` pass 1, streaming, O(1) RAM), then a
-final encode applies the gain and true-peak limit. Dolby Atmos: not possible without a Dolby
-license; an `Exporter` plugin hook receives the stems and bed/object metadata for a licensed
-encoder later. We ship stereo, 5.1, 7.1 (AAC, AC-3, E-AC-3, Opus, FLAC, PCM).
+**Audio.** (As built in Phase 3; details in §3a.) Per chunk: ffmpeg mixes bus graphs
+(`amix`, numpy-computed gain envelopes applied with `amultiply`, EQ, compressor, reverb)
+into 32-bit float PCM, from a pre-roll before the chunk start so filter state is warm.
+Chunks are concatenated as PCM (sample-exact), loudness is measured once over the full file
+(`ebur128` pass 1, streaming, O(1) RAM), then a final encode applies the gain and true-peak
+limit, and the output is measured again. Dolby Atmos: not possible without a Dolby license;
+an `Exporter` plugin hook (not built yet) would receive the stems for a licensed encoder.
+We ship stereo, 5.1, 7.1: AAC, Opus, FLAC (all layouts), AC-3 / E-AC-3 (up to 5.1).
 
 **Preview.** Same graph at proxy resolution reading proxy files. Scrub = single-frame
 request; the engine keeps only the newest pending request per client (older ones dropped),
@@ -224,6 +231,63 @@ the segment renderer falls behind real time.
 
 ---
 
+## 3a. Audio engine (Phase 3, implemented)
+
+```
+clip:  decode → resample → layout routing → trim → [reverse] → [atempo] → × clip envelope
+       (fades, volume keyframes) → gain → balance pan → delay to window position → clip fx
+bus:   Σ clips (amix, no normalisation) → bus fx → bus gain → × duck envelope ─┬─► stem
+master: Σ buses → master fx → master gain → trim pre-roll ◄────────────────────┘
+chunk file (.mka, pcm_f32le): stream 0 = master, 1..4 = dialogue, music, fx, ambience
+final: concat PCM → ebur128 (pass 1) → gain + 4x-oversampled limiter → encode → ebur128
+       verify → re-encode with corrections if needed (≤ 3 encodes)
+```
+
+**Chunk safety (differs from the first draft).** The draft planned `sidechaincompress` for
+ducking. A sidechain compressor's envelope depends on the past, so it breaks at chunk
+boundaries. Instead:
+- *Gain automation is deterministic.* Fades, volume keyframes and ducking are computed by
+  numpy from timeline positions only (never from where a chunk starts), written as a raw
+  f32 envelope next to the chunk's `.part` file, and multiplied in with `amultiply`.
+  Ducking = smoothstep ramp down `duck_attack` s *before* each dialogue clip (look-ahead:
+  the timeline is known), hold `duck_db` (default −12 dB), ramp up over `duck_release`.
+- *Stateful effects get a pre-roll.* When any audio effect is used, each chunk is rendered
+  from `2 s + longest reverb tail` before its first sample and the pre-roll is trimmed.
+  Effects also get 1 s of trailing silence so no filter hits end-of-stream in the window.
+  Measured: compressor/de-esser/EQ/reverb/fades/keyframes match a single-chunk render to
+  float rounding (≤ 1e-6); `afftdn` differs by ~−50 dB of peak (its adaptive noise estimate
+  never fully forgets its start); without pre-roll the same test differs by 0.02-0.04 (clicks).
+
+**Effects** (ffmpeg filters): `equalizer` (peaking band, stackable), `highpass`/`lowpass`,
+`acompressor`, `alimiter` (auto-level off, latency compensated), `deesser`, `afftdn`, and
+reverb = `afir` convolution with **procedurally generated impulse responses** (decorrelated
+noise per channel, two-band exponential decay to −60 dB at the room's RT60, pre-delay,
+discrete early reflections; cave = sparse tail). Rooms: small_room 0.45 s, hall 1.9 s,
+cathedral 4.2 s, cave 3.0 s RT60. They are not measured rooms. LFE gets no reverb.
+
+**Layouts.** stereo (default), 5.1 (FL FR FC LFE BL BR), 7.1 (+SL SR); mono for old projects.
+Routing never invents channels: in 5.1/7.1 a mono source goes to FC, a stereo source to
+FL/FR; no automatic surround upmix, LFE only from multichannel sources. Pan = balance
+(left-side channels × min(1, 1−p), right-side × min(1, 1+p); centre/LFE untouched).
+Downmix (final encode only): Lo = FL + 0.707·FC + 0.707·BL (+ 0.707·SL), LFE dropped;
+7.1 → 5.1 folds SL/SR into BL/BR at 0.707. Codecs: AAC (≤ 7.1), AC-3 / E-AC-3 (≤ 5.1),
+Opus (≤ 7.1, mapping family 1), FLAC (≤ 7.1); checked before any chunk is rendered.
+
+**Loudness.** Target −14 LUFS (YouTube) by default, `broadcast` = −23; true peak ≤ −1 dBTP.
+Pass 1 measures the concatenated master PCM with `ebur128=peak=true` (streaming). The
+final encode applies `target − I`; the limiter (and its 192 kHz resampling) runs only if
+measured true peak + gain could reach the ceiling, so a quiet mix stays bit-identical to the
+stems' sum. The output is measured again; lossy encoders overshoot, so a miss
+(TP > ceiling or |ΔI| > 0.3 LU) triggers a corrected re-encode (≤ 3 total; video is stream-
+copied each time). `alimiter` at 4x is a sample-peak limiter on an oversampled signal, a
+close approximation of a true-peak limiter, not a certified one; the verification pass is
+what guarantees the number.
+
+**Stems.** Per-bus stems (FLAC 24-bit or float WAV) from the same chunk PCM, same gain as
+the master, no limiter, sample-aligned to the video (start 0, same length). They are post
+bus-fx/ducking and pre master-fx: they sum to the master exactly when the master chain is
+empty and the limiter did not engage.
+
 ## 4. Cache keys and invalidation
 
 Key = `blake2b(canonical_json(inputs), digest_size=20)` where inputs are:
@@ -233,7 +297,7 @@ Key = `blake2b(canonical_json(inputs), digest_size=20)` where inputs are:
 | Asset fingerprint | file size, mtime_ns, BLAKE2b of first 4 MB + middle 4 MB + last 4 MB. Full-file hash computed in background for dedup. |
 | Proxy / peaks / thumbs | asset fingerprint, proxy kind, params, engine version |
 | Render chunk | ChunkPlan with times **relative to chunk start**, every referenced asset fingerprint, effect plugin id + version, render settings (codec, crf, res, fps, pix_fmt), engine version |
-| Audio chunk | same, for the audio graph |
+| Audio chunk | same, for the audio graph, plus audio graph version, pre-roll length, bus settings + bus effect chains, and the dialogue intervals (window-relative) that drive ducking. Any bus change re-renders all audio chunks (cheap: ~0.4 s per 10 s chunk). |
 | Generated asset (AI image/video/TTS/music) | provider, model, prompt (normalized), seed, references (fingerprints), params |
 | Preview frame | ChunkPlan slice at t, quality level |
 

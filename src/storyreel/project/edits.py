@@ -15,12 +15,15 @@ import time
 from fractions import Fraction
 from typing import Any
 
+from storyreel.audio import spec as aspec
 from storyreel.errors import StoryReelError
 from storyreel.render import fxspec
 from storyreel.timebase import FLICKS
 
 UNDO_KEEP = 200  # spec asks for 50; commands are tiny, keep more
-_TABLES = frozenset({"track", "clip", "keyframe", "effect", "transition"})
+_TABLES = frozenset(
+    {"track", "clip", "keyframe", "effect", "transition", "bus", "bus_effect", "project"}
+)
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 VISUAL_KINDS = frozenset({"color", "text", "generator", "adjust"})
 
@@ -89,6 +92,27 @@ def _check_value(name: str, value: Any, default: Any) -> None:
         raise EditError(f"Parameter {name} must be a {type(default).__name__}.")
     if isinstance(default, str) and default.startswith("#") and not _HEX.match(str(value)):
         raise EditError(f"Parameter {name} must be a color like #1a2b3c.")
+
+
+def _check_range(name: str, value: Any, rng: tuple[float, float] | None) -> None:
+    if rng is not None and isinstance(value, int | float) and not isinstance(value, bool):
+        lo, hi = rng
+        if not lo <= float(value) <= hi:
+            raise EditError(f"{name} must be between {lo:g} and {hi:g} (got {value:g}).")
+
+
+def _check_audio_effect(etype: str, params: dict[str, Any]) -> None:
+    spec = aspec.EFFECTS.get(etype)
+    if spec is None:
+        raise EditError(f"Unknown audio effect {etype!r}. Available: {sorted(aspec.EFFECTS)}.")
+    for k, v in params.items():
+        if k not in spec:
+            raise EditError(f"Audio effect {etype} has no parameter {k!r}.")
+        _check_value(k, v, spec[k])
+        _check_range(f"{etype}.{k}", v, aspec.EFFECT_RANGES.get((etype, k)))
+    room = params.get("room")
+    if etype == "reverb" and room is not None and room not in aspec.ROOMS:
+        raise EditError(f"Reverb room must be one of {sorted(aspec.ROOMS)}.")
 
 
 class Editor:
@@ -250,7 +274,7 @@ class Editor:
             if not _HEX.match(color):
                 raise EditError("Color must look like #1a2b3c.")
             props["color"] = color
-        self._validate_props(kind, props)
+        self._validate_props(kind, props, audio=track["kind"] == "audio", duration=duration)
         if kind == "media" and asset_id is None:
             raise EditError("A media clip needs an asset.")
         if kind != "media" and asset_id is not None:
@@ -277,11 +301,25 @@ class Editor:
         )
         return int(row["id"])
 
-    def _validate_props(self, kind: str, props: dict[str, Any]) -> None:
+    def _validate_props(
+        self, kind: str, props: dict[str, Any], *, audio: bool = False, duration: int = 0
+    ) -> None:
         allowed: dict[str, Any] = {
             k: v for k, v in fxspec.TRANSFORM_DEFAULTS.items() if k != "speed"
         }
         allowed |= {"reverse": False, "freeze": False, "blend": False, "color": "#000000"}
+        if audio:
+            allowed |= aspec.CLIP_PROPS
+            for k, rng in aspec.CLIP_RANGES.items():
+                if k in props and props[k] is not None:
+                    _check_value(k, props[k], aspec.CLIP_PROPS[k])
+                    _check_range(k, props[k], rng)
+            fades = float(props.get("fade_in") or 0.0) + float(props.get("fade_out") or 0.0)
+            if duration and fades > duration / FLICKS + 1e-9:
+                raise EditError(
+                    f"Fade in + fade out ({fades:g} s) is longer than the clip "
+                    f"({duration / FLICKS:.3f} s)."
+                )
         if kind == "text":
             allowed |= fxspec.TEXT_DEFAULTS
             if not str(props.get("text", "")).strip():
@@ -343,9 +381,12 @@ class Editor:
         old = json.loads(clip["props"])
         new = {**old, **props}
         new = {k: v for k, v in new.items() if v is not None}
-        self._validate_props(clip["kind"], new)
+        track = self._row("track", clip["track_id"])
+        self._validate_props(
+            clip["kind"], new, audio=track["kind"] == "audio", duration=clip["duration"]
+        )
         trial = {**clip, "props": json.dumps(new)}
-        self._check_media(self._row("track", clip["track_id"]), trial)
+        self._check_media(track, trial)
         op = {
             "op": "update",
             "table": "clip",
@@ -369,8 +410,12 @@ class Editor:
     def _keyframe_op(
         self, clip: Row, param: str, t: int, value: float, interp: str, ease: str
     ) -> Op:
-        if not fxspec.keyframable_param(param, self._effect_types(clip["id"])):
-            raise EditError(f"{param!r} cannot be animated on this clip.")
+        audio = self._row("track", clip["track_id"])["kind"] == "audio"
+        if not fxspec.keyframable_param(param, self._effect_types(clip["id"]), audio=audio):
+            hint = " Audio clips animate `volume` (dB)." if audio else ""
+            raise EditError(f"{param!r} cannot be animated on this clip.{hint}")
+        if param == "volume":
+            _check_range("volume", value, aspec.VOLUME_RANGE)
         if interp not in ("hold", "linear", "bezier"):
             raise EditError("Interpolation must be hold, linear or bezier.")
         if ease not in fxspec.EASINGS:
@@ -456,13 +501,22 @@ class Editor:
 
     # -- effects -----------------------------------------------------------------------
     def _effect_row(self, clip_id: int, etype: str, params: dict[str, Any], idx: int) -> Row:
-        spec = fxspec.EFFECTS.get(etype)
-        if spec is None:
-            raise EditError(f"Unknown effect {etype!r}. Available: {sorted(fxspec.EFFECTS)}.")
-        for k, v in params.items():
-            if k not in spec:
-                raise EditError(f"Effect {etype} has no parameter {k!r}.")
-            _check_value(k, v, spec[k])
+        clip = self._row("clip", clip_id)
+        if self._row("track", clip["track_id"])["kind"] == "audio":
+            if etype in fxspec.EFFECTS:
+                raise EditError(f"{etype} is a video effect; this clip is on an audio track.")
+            _check_audio_effect(etype, params)
+        else:
+            spec = fxspec.EFFECTS.get(etype)
+            if spec is None:
+                hint = " (that is an audio effect)" if etype in aspec.EFFECTS else ""
+                raise EditError(
+                    f"Unknown video effect {etype!r}{hint}. Available: {sorted(fxspec.EFFECTS)}."
+                )
+            for k, v in params.items():
+                if k not in spec:
+                    raise EditError(f"Effect {etype} has no parameter {k!r}.")
+                _check_value(k, v, spec[k])
         return {
             "id": self._next_id("effect"),
             "clip_id": clip_id,
@@ -560,3 +614,121 @@ class Editor:
         }
         self._commit(f"Add {kind}", [{"op": "insert", "table": "transition", "row": row}])
         return int(row["id"])
+
+    # -- audio: tracks, buses, project settings ---------------------------------------
+    def _bus(self, name: str) -> Row:
+        r = self.con.execute("SELECT * FROM bus WHERE name = ?", (name,)).fetchone()
+        if r is None:
+            raise EditError(f"Bus must be one of {list(aspec.ALL_BUSES)}.")
+        return dict(r)
+
+    def set_track(
+        self, track_id: int, *, bus: str | None = None, muted: bool | None = None
+    ) -> None:
+        track = self._row("track", track_id)
+        after: Row = {}
+        if bus is not None:
+            if track["kind"] != "audio":
+                raise EditError("Only audio tracks are routed to a bus.")
+            if bus not in aspec.BUSES:
+                raise EditError(
+                    f"A track goes to one of {list(aspec.BUSES)} (master is the sum of them)."
+                )
+            after["bus"] = bus
+        if muted is not None:
+            after["muted"] = int(muted)
+        if not after:
+            raise EditError("Nothing to change: give bus= or muted=.")
+        before = {k: track[k] for k in after}
+        op = {"op": "update", "table": "track", "id": track_id, "before": before, "after": after}
+        self._commit(f"Track {track['name']}", [op])
+
+    def set_bus(self, name: str, **changes: Any) -> None:
+        """gain_db, muted, duck, duck_db, duck_attack, duck_release."""
+        bus = self._bus(name)
+        params = json.loads(bus["params"])
+        cols: Row = {}
+        for k, v in changes.items():
+            if k == "gain_db":
+                _check_value(k, v, 0.0)
+                _check_range(k, v, aspec.BUS_RANGES[k])
+                cols[k] = float(v)
+            elif k == "muted":
+                _check_value(k, v, False)
+                cols[k] = int(v)
+            elif k in aspec.BUS_PARAMS:
+                if name not in aspec.DUCKABLE:
+                    raise EditError(f"Only {sorted(aspec.DUCKABLE)} buses duck under dialogue.")
+                _check_value(k, v, aspec.BUS_PARAMS[k])
+                _check_range(k, v, aspec.BUS_RANGES.get(k))
+                params[k] = v
+            else:
+                raise EditError(
+                    f"Bus setting must be one of gain_db, muted, {', '.join(aspec.BUS_PARAMS)}."
+                )
+        if json.dumps(params) != bus["params"]:
+            cols["params"] = json.dumps(params)
+        if not cols:
+            return
+        before = {k: bus[k] for k in cols}
+        op = {"op": "update", "table": "bus", "id": bus["id"], "before": before, "after": cols}
+        self._commit(f"Bus {name}", [op])
+
+    def add_bus_effect(self, name: str, etype: str, **params: Any) -> int:
+        bus = self._bus(name)
+        _check_audio_effect(etype, params)
+        idx = int(
+            self.con.execute(
+                "SELECT coalesce(max(idx), -1) + 1 FROM bus_effect WHERE bus_id = ?", (bus["id"],)
+            ).fetchone()[0]
+        )
+        row: Row = {
+            "id": self._next_id("bus_effect"),
+            "bus_id": bus["id"],
+            "idx": idx,
+            "type": etype,
+            "params": json.dumps(params),
+            "enabled": 1,
+        }
+        self._commit(
+            f"Add {etype} to {name}", [{"op": "insert", "table": "bus_effect", "row": row}]
+        )
+        return int(row["id"])
+
+    def remove_bus_effect(self, effect_id: int) -> None:
+        row = self._row("bus_effect", effect_id)
+        self._commit(f"Remove {row['type']}", [{"op": "delete", "table": "bus_effect", "row": row}])
+
+    def set_audio(self, **changes: Any) -> None:
+        """Project audio: layout (mono/stereo/5.1/7.1), target_lufs, true_peak, normalize."""
+        proj = self._row("project", 1)
+        audio = json.loads(proj["audio"])
+        cols: Row = {}
+        for k, v in changes.items():
+            if k == "layout":
+                if isinstance(v, int | float) and not isinstance(v, bool):
+                    v = f"{v:g}"  # `layout=5.1` arrives from the CLI as a number
+                if v not in aspec.LAYOUT_NAMES:
+                    raise EditError(f"Layout must be one of {list(aspec.LAYOUT_NAMES)}.")
+                cols["channels"] = aspec.LAYOUT_NAMES[v]
+            elif k == "target_lufs" and isinstance(v, str):
+                if v not in aspec.LOUDNESS_PRESETS:
+                    raise EditError(
+                        f"target_lufs is a number or one of {sorted(aspec.LOUDNESS_PRESETS)}."
+                    )
+                audio[k] = aspec.LOUDNESS_PRESETS[v]
+            elif k in aspec.LOUDNESS_DEFAULTS:
+                _check_value(k, v, aspec.LOUDNESS_DEFAULTS[k])
+                _check_range(k, v, aspec.LOUDNESS_RANGES.get(k))
+                audio[k] = v
+            else:
+                raise EditError(
+                    f"Audio setting must be one of layout, {', '.join(aspec.LOUDNESS_DEFAULTS)}."
+                )
+        if json.dumps(audio) != proj["audio"]:
+            cols["audio"] = json.dumps(audio)
+        if not cols:
+            return
+        before = {k: proj[k] for k in cols}
+        op = {"op": "update", "table": "project", "id": 1, "before": before, "after": cols}
+        self._commit("Audio settings", [op])

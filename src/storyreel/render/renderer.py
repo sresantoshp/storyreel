@@ -21,12 +21,23 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from storyreel.audio import graph as agraph
+from storyreel.audio import loudness
+from storyreel.audio import spec as aspec
+from storyreel.audio.envelope import write_f32
+from storyreel.audio.ir import ensure_ir
 from storyreel.errors import ExitCode, StoryReelError, ToolFailedError
 from storyreel.jobs.runner import JobStats, MemoryPressureError, run_ffmpeg
 from storyreel.proc import run
 from storyreel.project.store import Project
 from storyreel.render import ffgraph
-from storyreel.render.plan import ChunkPlan, RenderSettings, load_timeline, plan_chunks
+from storyreel.render.plan import (
+    ChunkPlan,
+    RenderSettings,
+    load_mix,
+    load_timeline,
+    plan_chunks,
+)
 from storyreel.watchdog import MemState, Watchdog
 
 log = logging.getLogger(__name__)
@@ -53,6 +64,12 @@ class RenderSummary:
     peak_job_commit: int
     output_bytes: int
     memory_retries: int
+    loudness_i: float | None = None  # measured on the final output
+    loudness_lra: float | None = None
+    true_peak: float | None = None
+    loudness_gain_db: float = 0.0  # gain applied by normalisation
+    audio_passes: int = 0  # final encodes needed to meet loudness / true-peak targets
+    stems: tuple[str, ...] = ()
 
     @property
     def hit_rate(self) -> float:
@@ -162,6 +179,8 @@ class Renderer:
                 raise
             finally:
                 part.with_name(part.name + ".spec.json").unlink(missing_ok=True)
+                for side in part.parent.glob(part.name + ".env*.f32"):
+                    side.unlink(missing_ok=True)
             _fsync_replace(part, final)
             self.peak_commit = max(self.peak_commit, stats.peak_commit or 0)
             return stats
@@ -177,18 +196,179 @@ class Renderer:
         return [sys.executable, "-m", "storyreel.render.worker", str(spec_path)]
 
     def _audio_argv(self, plan: ChunkPlan, part: Path, low_mem: bool) -> list[str]:
-        return ffgraph.audio_argv(self.ffmpeg, plan, self.s, part)
+        sr, ch = self.s.sample_rate, self.s.channels
+        ir_dir = self.p.root / "cache" / "ir"
+        ctx = agraph.AudioContext(
+            sr, aspec.layout(ch), lambda room: ensure_ir(ir_dir, room, sr, ch), part
+        )
+        argv, side = agraph.build(self.ffmpeg, plan, part, ctx)
+        for path, data in side:
+            write_f32(path, data)
+        return argv
+
+    def _check_audio_settings(self) -> int:
+        s = self.s
+        if s.acodec not in aspec.CODECS:
+            raise RenderError(
+                f"Unknown audio codec {s.acodec!r}.", fix=f"Use one of {sorted(aspec.CODECS)}."
+            )
+        try:
+            aspec.layout(s.channels)
+        except ValueError as exc:
+            raise RenderError(f"Project audio layout: {exc}.") from exc
+        out_ch = s.out_channels or s.channels
+        try:
+            agraph.downmix_filter(s.channels, out_ch)
+        except ValueError as exc:
+            raise RenderError(f"{exc}.", fix="Downmix to stereo (2) instead.") from exc
+        if out_ch > aspec.CODECS[s.acodec].max_channels:
+            raise RenderError(
+                f"{s.acodec} cannot carry {aspec.layout(out_ch).name} audio.",
+                fix="Use aac, opus or flac, or downmix to 5.1/stereo.",
+            )
+        if s.stems not in (None, "flac", "wav"):
+            raise RenderError("Stems are written as flac or wav.")
+        return out_ch
+
+    def _measure(self, inputs: list[str], pre_filter: str = "") -> loudness.Loudness:
+        return loudness.measure(
+            self.ffmpeg,
+            inputs,
+            pre_filter=pre_filter,
+            limit_bytes=self.wd.cap,
+            watchdog=self.wd,
+        )
+
+    def _finish_audio(
+        self, vlist: Path, alist: Path, out: Path, out_ch: int
+    ) -> tuple[loudness.Loudness, float, int]:
+        """Measure → encode → verify; re-encode with corrections if a target was missed.
+
+        Returns (loudness of the output, gain applied, number of encodes).
+        """
+        s = self.s
+        downmix = agraph.downmix_filter(s.channels, out_ch)
+        concat = ["-f", "concat", "-safe", "0", "-i", str(alist)]
+        gain, ceiling, limit = 0.0, s.true_peak, False
+        target = s.target_lufs
+        if target is not None:
+            t0 = time.monotonic()
+            src = self._measure(concat, downmix)
+            self.emit(
+                {
+                    "event": "loudness_measure",
+                    "integrated": src.integrated,
+                    "true_peak": src.true_peak,
+                    "wall_s": round(time.monotonic() - t0, 3),
+                }
+            )
+            if src.silent:
+                self.emit({"event": "warning", "message": "The mix is silent; no loudness gain."})
+                target = None
+            else:
+                gain = target - src.integrated
+                # lossy encoders overshoot the limiter; start with a margin
+                ceiling = s.true_peak - (0.5 if aspec.CODECS[s.acodec].lossy else 0.1)
+                # the limiter (and its 4x resampling) only runs when peaks could reach it
+                limit = src.true_peak + gain > ceiling - 0.5
+        part = out.with_name(out.name + ".part")
+        result: loudness.Loudness | None = None
+        passes = 0
+        for passes in range(1, 4):
+            t_pass = time.monotonic()
+            af = ",".join(
+                f
+                for f in (
+                    downmix,
+                    loudness.normalize_filter(gain, ceiling, s.sample_rate, limit=limit)
+                    if target is not None
+                    else "",
+                )
+                if f
+            )
+            try:
+                run_ffmpeg(
+                    ffgraph.mux_argv(
+                        self.ffmpeg, vlist, alist, s, part, audio_filter=af, channels=out_ch
+                    ),
+                    limit_bytes=self.wd.cap,
+                    watchdog=self.wd,
+                )
+                result = self._measure(["-i", str(part)])
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            if target is None:
+                break
+            tp_over = result.true_peak - s.true_peak
+            i_off = target - result.integrated
+            self.emit(
+                {
+                    "event": "loudness_pass",
+                    "pass": passes,
+                    "integrated": result.integrated,
+                    "true_peak": result.true_peak,
+                    "gain_db": round(gain, 3),
+                    "ceiling_db": round(ceiling, 3),
+                    "limiter": limit,
+                    "wall_s": round(time.monotonic() - t_pass, 3),
+                }
+            )
+            if tp_over <= 0.0 and abs(i_off) <= 0.3:
+                break
+            if passes == 3:
+                self.emit(
+                    {
+                        "event": "warning",
+                        "message": (
+                            f"Loudness {result.integrated:.1f} LUFS / true peak "
+                            f"{result.true_peak:.1f} dBTP after 3 encodes "
+                            f"(target {target:.1f} LUFS, {s.true_peak:.1f} dBTP)."
+                        ),
+                    }
+                )
+                break
+            if tp_over > 0.0:
+                if limit:
+                    ceiling -= tp_over + 0.2
+                limit = True
+            gain += i_off
+        _fsync_replace(part, out)
+        assert result is not None
+        return result, gain, passes
+
+    def _write_stems(self, alist: Path, out: Path, gain: float) -> tuple[str, ...]:
+        fmt = self.s.stems or "flac"
+        folder = out.with_name(out.stem + "_stems")
+        folder.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for k, bus in enumerate(aspec.BUSES, start=1):
+            final = folder / f"{bus}.{fmt}"
+            part = final.with_name(final.name + ".part")
+            try:
+                run_ffmpeg(
+                    ffgraph.stem_argv(self.ffmpeg, alist, k, gain, fmt, part),
+                    limit_bytes=self.wd.cap,
+                    watchdog=self.wd,
+                )
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            _fsync_replace(part, final)
+            paths.append(str(final))
+        return tuple(paths)
 
     # -- main --------------------------------------------------------------------------
     def plan(self) -> list[ChunkPlan]:
         warnings: list[str] = []
-        plans = plan_chunks(load_timeline(self.p), self.s, warnings)
+        plans = plan_chunks(load_timeline(self.p), self.s, warnings, load_mix(self.p))
         for w in warnings:
             self.emit({"event": "warning", "message": w})
         return plans
 
     def render(self, out: Path) -> RenderSummary:
         t0 = time.monotonic()
+        out_ch = self._check_audio_settings()
         plans = self.plan()
         if not plans:
             raise RenderError(
@@ -230,9 +410,19 @@ class Renderer:
                 apath = self._cached(akey)
                 if apath is None:
                     apath = self.p.chunks_dir / f"{akey}.mka"
-                    self._run_job(partial(self._audio_argv, plan), apath)
+                    st = self._run_job(partial(self._audio_argv, plan), apath)
                     self._store(akey, "achunk", apath)
                     adone += 1
+                    self.emit(
+                        {
+                            "event": "audio_chunk",
+                            "idx": plan.idx,
+                            "cached": False,
+                            "wall_s": round(st.wall_s, 3),
+                            "peak_rss_mb": st.peak_rss >> 20,
+                            "preroll_s": round(plan.preroll / self.s.sample_rate, 3),
+                        }
+                    )
                 else:
                     ahits += 1
                 self.emit({"event": "chunk_done", "idx": plan.idx, "of": len(plans)})
@@ -250,17 +440,11 @@ class Renderer:
             self.p.renders_dir.mkdir(parents=True, exist_ok=True)
             vlist.write_text(ffgraph.concat_list(ventries), encoding="utf-8")
             alist.write_text(ffgraph.concat_list(aentries), encoding="utf-8")
-            part = out.with_name(out.name + ".part")
-            try:
-                run_ffmpeg(
-                    ffgraph.mux_argv(self.ffmpeg, vlist, alist, self.s, part),
-                    limit_bytes=self.wd.cap,
-                    watchdog=self.wd,
-                )
-            except BaseException:
-                part.unlink(missing_ok=True)
-                raise
-            _fsync_replace(part, out)
+            loud, gain, passes = self._finish_audio(vlist, alist, out, out_ch)
+            stems: tuple[str, ...] = ()
+            if self.s.stems:
+                self.emit({"event": "stems"})
+                stems = self._write_stems(alist, out, gain)
         except StoryReelError as exc:
             self._job_end(job_id, "failed", exc.message)
             if isinstance(exc, MemoryPressureError | RenderError):
@@ -290,6 +474,12 @@ class Renderer:
             peak_job_commit=self.peak_commit,
             output_bytes=out.stat().st_size,
             memory_retries=self.memory_retries,
+            loudness_i=loud.integrated,
+            loudness_lra=loud.lra,
+            true_peak=loud.true_peak,
+            loudness_gain_db=round(gain, 3),
+            audio_passes=passes,
+            stems=stems,
         )
         self._job_end(job_id, "done", None, summary.peak_tree_rss)
         self.emit({"event": "summary", **asdict(summary), "hit_rate": round(summary.hit_rate, 4)})

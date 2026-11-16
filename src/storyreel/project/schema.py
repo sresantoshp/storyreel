@@ -162,6 +162,34 @@ MIGRATIONS: list[str] = [
         UNIQUE (clip_a), UNIQUE (clip_b)
     );
     """,
+    # 3: Phase 3 audio engine: buses, bus effect chains, project audio settings
+    """
+    ALTER TABLE track ADD COLUMN bus TEXT NOT NULL DEFAULT 'dialogue'
+        CHECK (bus IN ('dialogue', 'music', 'fx', 'ambience'));
+    CREATE TABLE bus (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE
+            CHECK (name IN ('dialogue', 'music', 'fx', 'ambience', 'master')),
+        gain_db REAL NOT NULL DEFAULT 0,
+        muted INTEGER NOT NULL DEFAULT 0,
+        params TEXT NOT NULL DEFAULT '{}'  -- JSON: duck, duck_db, duck_attack, duck_release
+    );
+    INSERT INTO bus(id, name, params) VALUES
+        (1, 'dialogue', '{}'),
+        (2, 'music', '{"duck": true}'),
+        (3, 'fx', '{}'),
+        (4, 'ambience', '{"duck": true}'),
+        (5, 'master', '{}');
+    CREATE TABLE bus_effect (
+        id INTEGER PRIMARY KEY,
+        bus_id INTEGER NOT NULL REFERENCES bus(id),
+        idx INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        params TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1
+    );
+    ALTER TABLE project ADD COLUMN audio TEXT NOT NULL DEFAULT '{}';  -- loudness settings
+    """,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
