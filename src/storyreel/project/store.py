@@ -152,10 +152,33 @@ class Project:
         self.close()
 
 
+def _process_started(pid: int) -> float | None:
+    try:
+        return float(psutil.Process(pid).create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
+
+
+def lock_holder_alive(pid: int, started: float | None) -> bool:
+    """True only if `pid` is the same process that wrote the lock.
+
+    PIDs are reused (quickly on Windows: seen in CI seconds after a kill), so a bare
+    pid_exists() check can mistake an unrelated process for the lock holder and lock the
+    user out of their project after a crash. The process start time disambiguates.
+    """
+    if pid <= 0 or not psutil.pid_exists(pid):
+        return False
+    if started is None:  # lock written by an older StoryReel: best effort
+        return True
+    now = _process_started(pid)
+    return now is not None and abs(now - started) < 1.0
+
+
 def _acquire_lock(root: Path) -> int | None:
     """Create the lock file. Returns the PID of a stale lock that was taken over, if any."""
     lock = root / LOCK_NAME
-    payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "t": time.time()})
+    payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "t": time.time(),
+                          "started": _process_started(os.getpid())})  # fmt: skip
     stale: int | None = None
     for _ in range(2):
         try:
@@ -164,9 +187,11 @@ def _acquire_lock(root: Path) -> int | None:
             try:
                 info = json.loads(lock.read_text(encoding="utf-8"))
                 pid, host = int(info["pid"]), str(info["host"])
-            except (OSError, ValueError, KeyError):
-                pid, host = -1, socket.gethostname()  # unreadable lock: treat as stale
-            if host == socket.gethostname() and pid > 0 and psutil.pid_exists(pid):
+                started = info.get("started")
+                started = float(started) if started is not None else None
+            except (OSError, ValueError, KeyError, TypeError):
+                pid, host, started = -1, socket.gethostname(), None  # unreadable: stale
+            if host == socket.gethostname() and lock_holder_alive(pid, started):
                 if pid == os.getpid():
                     raise ProjectLockedError(
                         f"Project {root.name} is already open in this process."

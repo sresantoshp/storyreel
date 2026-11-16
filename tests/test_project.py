@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sqlite3
 import time
@@ -112,3 +113,29 @@ def test_committed_edit_survives_hard_kill(tmp_path: Path) -> None:
     other.close()
     p.con.close()
     (root / "project.lock").unlink()
+
+
+def test_lock_survives_pid_reuse(tmp_path: Path) -> None:
+    """A crashed holder whose PID now belongs to another live process must count as stale.
+
+    Simulated with this test process's own PID but a different start time, which is exactly
+    what Windows PID reuse looks like (found by CI on windows-latest).
+    """
+    root = tmp_path / "p.storyreel"
+    with store.create(root, SETTINGS):
+        pass
+    reused = {"pid": os.getpid(), "host": socket.gethostname(), "started": 12345.0}
+    (root / "project.lock").write_text(json.dumps(reused))
+    with store.open_project(root) as p:  # must not raise "open in another process"
+        assert p.recovery.stale_lock_pid == os.getpid()
+
+
+def test_lock_holder_alive_rules() -> None:
+    import psutil
+
+    me = os.getpid()
+    started = psutil.Process(me).create_time()
+    assert store.lock_holder_alive(me, started)
+    assert not store.lock_holder_alive(me, started - 60)  # same PID, different process
+    assert store.lock_holder_alive(me, None)  # old lock format: trust pid_exists
+    assert not store.lock_holder_alive(-1, None)
