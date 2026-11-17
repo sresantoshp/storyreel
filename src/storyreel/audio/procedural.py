@@ -11,6 +11,9 @@ Building blocks
   * Events: short synthesised sounds placed at random times (Poisson) into a carry buffer
     that spans block boundaries: rain drops, fire crackles, water bubbles (Minnaert
     model), bird calls.
+  * Environments: long frame-rate noise events (_Swells: ocean waves, thunder rolls, cicada
+    choruses), animals/objects at fixed places that call in bouts (_Singer, sounds from
+    storyreel.audio.sfx), and reverb sends for distance (valley echo, forest).
   * Music: additive pads (detuned partials with a soft roll-off = a gentle low-pass),
     chord progressions per mood, bass, plucked arpeggios, an optional low drum, and a
     procedural hall reverb (storyreel.audio.ir) applied by FFT overlap-add convolution.
