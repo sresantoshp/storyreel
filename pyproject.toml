@@ -17,6 +17,15 @@ dependencies = [
 [project.scripts]
 storyreel = "storyreel.cli:main"
 
+[project.optional-dependencies]
+translate = [
+    "indic-nlp-library>=0.92",
+    "sacremoses>=0.1",
+    "sentencepiece>=0.2",
+    "torch>=2.5",
+    "transformers>=4.46,<5",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
