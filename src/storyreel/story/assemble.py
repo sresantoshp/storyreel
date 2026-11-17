@@ -222,17 +222,21 @@ def _place_cast(
         else:
             per_s = 1.1 if sp in actors.QUADS else 0.8
         speed = per_s * height_px / w  # frame widths per second
-        x_stop = 0.36 - 0.13 * slot  # left of centre: clear of rivers and the campfire
-        props = {**common, "y": y, "size": size}
+        # slots 0-2 enter from the left and stop left of centre (clear of rivers and the
+        # campfire); a 4th character enters from the right and stops facing them
+        side = 1.0 if slot < 3 else -1.0
+        x_stop = 0.36 - 0.13 * slot if slot < 3 else 0.64
+        props = {**common, "y": y, "size": size, "facing": "right" if side > 0 else "left"}
         if action == "idle":
             clip(track, t0, t1, {**props, "action": "idle", "x": x_stop, "speed": 0.0}, True)
             continue
-        x0 = -0.12 - 0.12 * slot
+        x0 = -0.12 - 0.12 * slot if slot < 3 else 1.12
+        speed *= side
         if action == "run":
-            end = min(t1, t0 + (1.25 - x0) / speed)
+            end = min(t1, t0 + 1.37 / abs(speed))
             clip(track, t0, end, {**props, "action": "run", "x": x0, "speed": speed}, False)
             continue
-        t_walk = (x_stop - x0) / speed
+        t_walk = abs(x_stop - x0) / abs(speed)
         if t_walk >= dur - 0.5:
             clip(track, t0, t1, {**props, "action": "walk", "x": x0, "speed": speed}, False)
             continue
@@ -240,7 +244,13 @@ def _place_cast(
         c0, c1 = _snap(rate, t0), _snap(rate, t0 + t_walk)
         ed.add_clip(track, c0, c1 - c0, kind="generator", props={"type": "actor", **walk_props})
         n += 1
-        idle = {**props, "action": "idle", "x": x_stop, "speed": 0.0, "facing": "right"}
+        idle = {
+            **props,
+            "action": "idle",
+            "x": x_stop,
+            "speed": 0.0,
+            "facing": "right" if side > 0 else "left",
+        }
         cid = ed.add_clip(
             track, c1, _snap(rate, t1) - c1, kind="generator", props={"type": "actor", **idle}
         )

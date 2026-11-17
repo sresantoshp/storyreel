@@ -21,7 +21,7 @@ from storyreel.render.actors import BIRDS, SPECIES, SWIMMERS
 from storyreel.story.kits import KITS
 from storyreel.story.schema import Scene
 
-MAX_CAST = 3
+MAX_CAST = 4  # 3 from the scene itself + 1 for an idea character the writer left out
 
 _EN: dict[str, tuple[str, ...]] = {
     "fox": ("fox", "foxes", "vixen"),
@@ -164,7 +164,16 @@ def assign(scenes: list[Scene], idea: str = "") -> list[str]:
             scene.kit = "beach" if any(w in words for w in ("shore", "beach", "sand")) else "ocean"
         cast: list[str] = []
         for sp in [*named, *mains]:
-            if sp not in cast and fits(sp, scene.kit) and len(cast) < MAX_CAST:
+            if sp not in cast and fits(sp, scene.kit) and len(cast) < MAX_CAST - 1:
                 cast.append(sp)
         scene.cast = cast
+    # Characters the idea asked for but the writer never wrote in: show them in the scenes
+    # whose environment is their home (a tiger in the jungle scenes), if there is room.
+    for sp in detect(idea)[2:]:
+        if any(sp in s.cast for s in scenes):
+            continue
+        homes = [s for s in scenes if set(_EN[sp]) & set(KITS[s.kit].keywords)]
+        for scene in homes or [s for s in scenes if fits(sp, s.kit)][:1]:
+            if len(scene.cast) < MAX_CAST and fits(sp, scene.kit):
+                scene.cast.append(sp)
     return mains

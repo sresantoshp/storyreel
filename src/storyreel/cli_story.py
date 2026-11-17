@@ -20,6 +20,7 @@ from typing import Any
 from storyreel.errors import ExitCode, StoryReelError
 from storyreel.story import assemble as asm
 from storyreel.story.planner import PlanRequest, plan_story
+from storyreel.story.schema import StoryPlan
 
 MB = 2**20
 
@@ -68,10 +69,12 @@ def cmd_make(a: argparse.Namespace) -> int:
     from storyreel.watchdog import Watchdog
 
     t_start = time.perf_counter()
-    if bool(a.idea) == bool(a.script_file):
-        raise StoryReelError("Give exactly one of --idea or --script-file.")
-    text = a.idea or Path(a.script_file).read_text(encoding="utf-8")
+    if sum(bool(x) for x in (a.idea, a.script_file, a.plan_file)) != 1:
+        raise StoryReelError("Give exactly one of --idea, --script-file or --plan-file.")
+    text = a.idea or (Path(a.script_file).read_text(encoding="utf-8") if a.script_file else "")
     mode = "script" if a.script_file and a.mode == "auto" else a.mode
+    if a.plan_file:
+        mode = "script"  # the story is already written: no length check against a target
     out = Path(a.out)
     root = Path(a.project_dir) if a.project_dir else out.with_suffix(".storyreel")
     if root.exists():
@@ -88,7 +91,16 @@ def cmd_make(a: argparse.Namespace) -> int:
 
     timings: dict[str, float] = {}
     t0 = time.perf_counter()
-    plan = plan_story(PlanRequest(text, parse_length(a.length), a.lang, mode, a.writer), say)
+    if a.plan_file:  # reuse a written story (e.g. plan.json from an earlier project)
+        try:
+            plan = StoryPlan.from_json(json.loads(Path(a.plan_file).read_text(encoding="utf-8")))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise StoryReelError(
+                f"Cannot read the story plan {a.plan_file}: {exc}",
+                fix="Point --plan-file at a plan.json written by storyreel make.",
+            ) from exc
+    else:
+        plan = plan_story(PlanRequest(text, parse_length(a.length), a.lang, mode, a.writer), say)
     timings["plan_s"] = time.perf_counter() - t0
     say(f"plan: '{plan.title}' — {len(plan.scenes)} scenes, {plan.language}, via {plan.source}")
     for w in plan.warnings:
@@ -171,6 +183,9 @@ def register(sub: Any) -> None:
     m = sub.add_parser("make", help="idea or script -> finished video (offline)")
     m.add_argument("--idea", help="one-line idea or short story (any language)")
     m.add_argument("--script-file", help="your own narration text file (UTF-8)")
+    m.add_argument(
+        "--plan-file", help="re-make from a plan.json (written story) without the AI writer"
+    )
     m.add_argument("--length", default="60s", help="target length for --idea, e.g. 45s, 3min")
     m.add_argument("--lang", default="auto", help="auto (from the text), en, hi, ta, te, kn")
     m.add_argument("--mode", default="auto", choices=["auto", "llm", "script", "rules"])
