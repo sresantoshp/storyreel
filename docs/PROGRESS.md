@@ -1,5 +1,74 @@
 # Progress
 
+## 2026-11-17 — Phase 4: story → video (`storyreel make`), characters, environments
+
+One command turns an idea (or your own script, or a saved plan) into a finished video,
+fully offline: `storyreel make --idea "..." --length 60s --out story.mp4`.
+
+### Works
+- **Writer:** local llama.cpp server (Qwen2.5-1.5B default, Phi-3.5-mini via `--writer`),
+  JSON-schema-constrained; outline-then-sections for long stories; rules fallback.
+- **Other languages:** written in English, then translated by IndicTrans2-200M (MIT,
+  pinned revision): Hindi, Tamil, Telugu, Kannada, Bengali, Gujarati.
+- **Characters (new):** 34 animated cut-out puppets drawn in code (render/actors.py):
+  - 15 animals: fox, dog, wolf, cat, deer, horse, cow, goat, sheep, tiger, lion, elephant,
+    bear, rabbit, monkey.
+  - 6 people: man, woman, boy, girl, grandpa, grandma.
+  - 9 birds: eagle, parrot, crow, sparrow, seagull, owl, peacock, hen, duck.
+  - 4 sea creatures: fish, dolphin, whale, turtle.
+  - Movement: legs use IK with planted feet (stride tied to speed); hop, flight with
+    glides, dolphin leaps, idle breathing and blinking, contact shadows.
+- **Casting (story/cast.py):** characters come from the story's own words (English + Hindi
+  stems). The idea's main characters appear in every scene; characters named in the idea
+  but left out by the writer appear in their home scenes (a tiger in the jungle); a scene
+  with a sea creature moves to water. On screen they walk in and stop, run ("hurried"),
+  or rest ("sat", "watched"); one clip per stretch of same-kit scenes.
+- **Environments (new):** 14 kits: night_sky, storm, snow_valley, sunny_valley, campfire,
+  misty_forest, forest, jungle, beach, ocean, hill_station, ice_land, village, desert.
+  - New layers: sky (sun/moon/stars/drifting clouds), animated sea and beach surf, hills
+    (tea rows, houses, lit windows), trees (pine/round/palm/jungle/bamboo), swaying grass
+    with flowers, ice with icebergs, houses/huts.
+  - The fire layer has a campfire mode with logs.
+- **Sound:** a Kokoro voice, a procedural ambience per kit (see "Phase 4 sound" above),
+  a mood music bed, and ducking.
+  - Mix: ambience −10 dB, music −11 dB.
+  - Final master: −14 LUFS / −1 dBTP.
+- **Subtitles:** per-scene cues, burned in and written as an .srt.
+- **`--plan-file`:** re-make a written story (plan.json) without running the writer again.
+
+### Measured (i3-1315U, 0.6-1.3 GB RAM free, user apps open)
+| | value |
+|---|---|
+| Translation, 3 sentences | hi 6.4 s, ta 6.5 s, te 5.0 s; 1.0 GB RSS (first load ~10 s) |
+| Showcase "journey" (9 scenes, 6 kits, 26 character clips, 720p) | 47.3 s video |
+| ... voice + sound + assembly | 296 s |
+| ... render | 900 s (≈1.6 fps; machine paging) |
+| ... peak RSS | 505 MB |
+| ... loudness | −14.1 LUFS, −1.4 dBFS peak |
+| Fox story (Phi writer, 720p) | 44.5 s for a 45 s target, 373 s total, 458 MB |
+| Scenery cost per frame, 960×540 | 45-100 ms (static parts drawn once) |
+| Tests | 330+ (new: tests/test_world.py) |
+
+### Bugs found this phase (fixed)
+- IndicTrans2's remote code crashes on transformers 4.57 cache objects: KV cache disabled.
+- Windows memory cap race: a child that exits instantly cannot be capped
+  (ERROR_ACCESS_DENIED). Children now start suspended, join the job, then resume.
+- Colour-list parameters (flower_colors) were rejected by the editor.
+- Characters stood on the river and in a full-width wall of fire: river curve flipped,
+  campfire mode added, stop positions moved left of centre.
+
+### Honest limits
+- Flat cut-out cartoon style, not realistic footage.
+- Characters walk in again at each kit change; no talking mouths.
+- One generic look per species; people get random clothes per seed.
+- Rendering is slow on this laptop (≈1.5-4 fps at 720p with characters).
+- The writer sometimes drops characters; the cast fallback places only those named in the
+  idea.
+- Nobody has listened to the voice or ambiences yet: every judgement so far is from
+  measurements.
+- Weakest sounds (from measurements): rooster, crow, parrot; the icy wind may sound
+  synthetic.
+
 ## 2026-11-17 — Phase 4 sound: environments
 
 Ten new procedural ambiences, all made in code (numpy; no samples, no downloads), through
