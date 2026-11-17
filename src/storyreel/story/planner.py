@@ -19,8 +19,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from storyreel.errors import StoryReelError
+from storyreel.render.actors import SPECIES
+from storyreel.story import cast, llm, translate
 from storyreel.story import kits as kitmod
-from storyreel.story import llm, translate
 from storyreel.story.lang import LANG_NAMES, resolve_language
 from storyreel.story.schema import (
     MAX_SCENES_PER_CALL,
@@ -76,6 +77,7 @@ def script_to_plan(text: str, lang: str, *, source: str, title: str = "") -> Sto
         kit = kitmod.guess_kit(t, fallback=prev_kit)
         scenes.append(Scene(t, kit, kitmod.guess_mood(t, fallback=kitmod.KITS[kit].mood)))
         prev_kit = kit
+    cast.assign(scenes, text)
     first = sentences[0]
     if not title:
         title = first if len(first) <= 60 else first[:57].rsplit(" ", 1)[0] + "..."
@@ -94,7 +96,10 @@ def _system_prompt(lang: str) -> str:
         "story with a beginning, a middle and an ending; the last scene must finish the story. "
         "For each scene choose the visual kit that best fits it from this list:\n"
         + kitmod.describe_for_writer()
-        + "\nChoose a mood per scene. onscreen is an optional short caption (or empty)."
+        + "\nCharacters that can be shown on screen (prefer these and name them plainly, "
+        "e.g. 'the fox', so they appear): "
+        + ", ".join(sorted(SPECIES))
+        + ".\nChoose a mood per scene. onscreen is an optional short caption (or empty)."
     )
 
 
@@ -126,7 +131,7 @@ def _llm_plan(req: PlanRequest, lang: str, progress: Progress) -> StoryPlan:
         done_caps = tr.translate([c for c in caps if c], lang) if any(caps) else []
         it = iter(done_caps)
         translated = [
-            Scene(n, s.kit, s.mood, next(it) if s.onscreen else "")
+            Scene(n, s.kit, s.mood, next(it) if s.onscreen else "", list(s.cast))
             for n, s in zip(done[1:], english.scenes, strict=True)
         ]
         return StoryPlan(
@@ -188,6 +193,11 @@ def _llm_plan(req: PlanRequest, lang: str, progress: Progress) -> StoryPlan:
     changed = kitmod.refine_kits(scenes)
     if changed:
         progress(f"visuals: corrected {changed} scene kit(s) from the narration's own words")
+    mains = cast.assign(scenes, req.text)
+    progress(
+        f"cast: {', '.join(mains) or '(scenery only)'}; per scene: "
+        + " | ".join("+".join(s.cast) or "-" for s in scenes)
+    )
     if lang != "en" and any(_mostly_latin(s.narration) for s in scenes):
         warnings.append(f"Some narration came back in English instead of {LANG_NAMES[lang]}.")
     return StoryPlan(title, lang, scenes, f"llm:{key}", warnings)

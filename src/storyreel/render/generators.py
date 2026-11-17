@@ -17,6 +17,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from storyreel.render import actors, scenery
 from storyreel.render.fxspec import GENERATORS
 from storyreel.text.render import hex_rgb
 
@@ -35,6 +36,11 @@ class Generator:
         self._solid_rgb: np.ndarray | None = None
         self._static: Planes | None = None
         self._river_geom: tuple[np.ndarray, np.ndarray] = (np.zeros(0), np.zeros(0))
+        self._ext: scenery._Scene | actors.Actor | None = None
+        if gtype in scenery.KINDS:
+            self._ext = scenery.KINDS[gtype](self.p, width, height)
+        elif gtype == "actor":
+            self._ext = actors.Actor(self.p, width, height)
         seed = int(self.p.get("seed", 1))
         rng = np.random.default_rng(seed)
         n = int(self.p.get("count", self.p.get("ripples", 0)))  # particles per type
@@ -44,6 +50,8 @@ class Generator:
             self.noise = [_value_noise(rng, 64, 64), _value_noise(rng, 128, 128)]
 
     def frame(self, t: float) -> Planes:
+        if self._ext is not None:
+            return self._ext.frame(t)
         out: Planes = getattr(self, f"_{self.type}")(t)
         return out
 
@@ -187,13 +195,40 @@ class Generator:
         n = 0.6 * n1 + 0.4 * n2
         height = float(p["height"])
         yy = np.linspace(0.0, 1.0, lh, dtype=np.float32)[:, None]  # 0 at top, 1 at bottom
-        base = np.clip((yy - (1 - height)) / max(height, 1e-3), 0, 1)
+        width = float(p["width"])
+        if width > 0:  # one campfire: a flame cone over the logs
+            bottom = float(p["base"])
+            xx = np.linspace(0.0, 1.0, lw, dtype=np.float32)[None, :]
+            up = np.clip((bottom - yy) / max(height, 1e-3), 0, 1)  # 0 at the logs, 1 at tip
+            half = width / 2 * (1 - up) ** 1.3 + 1e-3
+            across = np.clip(1 - np.abs(xx - float(p["x"])) / half, 0, 1)
+            base = np.where(yy <= bottom, across * (1 - up * 0.6), 0.0).astype(np.float32)
+        else:
+            base = np.clip((yy - (1 - height)) / max(height, 1e-3), 0, 1)
         heat = np.clip(base * (0.35 + 1.1 * n) - 0.15 * (1 - base), 0, 1)
         heat = heat * float(p["intensity"])
         # palette at low resolution: dark red -> orange -> yellow -> white; upscale once
         rgb = np.dstack([np.clip(heat * 2.2, 0, 1), np.clip(heat * 1.8 - 0.45, 0, 1),
                          np.clip(heat * 2.5 - 1.6, 0, 1)]).astype(np.float32)  # fmt: skip
-        return self._up(rgb), self._up(np.clip(heat * 1.6, 0, 1))
+        rgb_f, a_f = self._up(rgb), self._up(np.clip(heat * 1.6, 0, 1))
+        if width > 0:  # logs under the flames (drawn over the fire's base)
+            w_, h_ = self.w, self.h
+            cx, by = float(p["x"]) * w_, float(p["base"]) * h_
+            lg = width * w_ * 0.55
+            for ang in (-14.0, 14.0):
+                rad = math.radians(ang)
+                dx, dy = math.cos(rad) * lg, math.sin(rad) * lg
+                pts = np.array([[cx - dx, by - dy], [cx + dx, by + dy]], np.int32)
+                cv2.line(
+                    rgb_f,
+                    tuple(pts[0]),
+                    tuple(pts[1]),
+                    (0.24, 0.13, 0.07),
+                    max(3, int(h_ / 60)),
+                    cv2.LINE_AA,
+                )
+                cv2.line(a_f, tuple(pts[0]), tuple(pts[1]), 1.0, max(3, int(h_ / 60)), cv2.LINE_AA)
+        return rgb_f, a_f
 
     def _particles(self, t: float) -> Planes:
         a = np.zeros((self.h, self.w), np.float32)

@@ -30,6 +30,7 @@ class Scene:
     kit: str
     mood: str
     onscreen: str = ""  # optional short headline shown on screen
+    cast: list[str] = field(default_factory=list)  # characters on screen (story.cast)
 
 
 @dataclass

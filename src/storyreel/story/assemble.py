@@ -18,17 +18,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from storyreel.errors import StoryReelError
 from storyreel.media.importer import import_files
 from storyreel.project import store
 from storyreel.project.edits import Editor
+from storyreel.render import actors
+from storyreel.story import cast as castmod
 from storyreel.story import subtitles
+from storyreel.story.cast import MAX_CAST
 from storyreel.story.kits import KITS
 from storyreel.story.schema import StoryPlan
 from storyreel.timebase import FLICKS, Rate
@@ -99,6 +103,154 @@ def _import_generated(
     return int(res.asset_id)
 
 
+_RUN_WORDS = (
+    "run",
+    "ran",
+    "runs",
+    "running",
+    "raced",
+    "races",
+    "hurried",
+    "hurries",
+    "rushed",
+    "dashed",
+    "chased",
+    "fled",
+    "sprinted",
+    "bolted",
+    "भाग",
+    "दौड़",
+)
+_IDLE_WORDS = ("sat", "sits", "sitting", "slept", "sleeps", "sleeping", "rested", "resting",
+               "watched", "watches", "waited", "waits", "stood", "standing", "listened",
+               "lay", "gazed", "ate", "eating", "बैठ", "सो ", "देख", "रुक")  # fmt: skip
+
+
+def _action(narration: str) -> str:
+    low = f" {narration.lower()} "
+    words = set(re.findall(r"[a-z]+", low))
+
+    def hit(vocab: tuple[str, ...]) -> bool:
+        return any((v in words) if v.isascii() else (v in low) for v in vocab)
+
+    if hit(_RUN_WORDS):
+        return "run"
+    if hit(_IDLE_WORDS):
+        return "idle"
+    return "walk"
+
+
+def _place_cast(
+    ed: Editor,
+    plan: StoryPlan,
+    starts: list[float],
+    durs: list[float],
+    runs: list[tuple[str, float, float]],
+    rate: Rate,
+    tracks: list[int],
+    w: int,
+    h: int,
+) -> int:
+    """Add `actor` generator clips for every scene's cast. A species that stays on screen
+    through consecutive scenes of the same kit is ONE clip pair (walk in, then idle), so it
+    does not restart at every scene cut."""
+    portrait = h > w
+    base = 0.2 if portrait else 0.3
+    n = 0
+    scene_run = [next(r for r, (_, a, b) in enumerate(runs) if a - 1e-6 <= s0 < b) for s0 in starts]
+    stretches: list[tuple[str, int, int, int]] = []  # (species, first, last, slot)
+    open_: dict[str, tuple[int, int]] = {}
+    for i, scene in enumerate(plan.scenes):
+        for sp in list(open_):
+            first, slot = open_[sp]
+            if sp not in scene.cast or scene_run[i] != scene_run[first]:
+                stretches.append((sp, first, i - 1, slot))
+                del open_[sp]
+        for slot, sp in enumerate(scene.cast[: len(tracks)]):
+            if sp not in open_:
+                open_[sp] = (i, slot)
+    for sp, (first, slot) in open_.items():
+        stretches.append((sp, first, len(plan.scenes) - 1, slot))
+
+    def clip(track: int, t0: float, t1: float, props: dict[str, Any], fade_in: bool) -> None:
+        nonlocal n
+        c0, c1 = _snap(rate, t0), _snap(rate, t1)
+        if c1 - c0 < _snap(rate, 0.2):
+            return
+        cid = ed.add_clip(track, c0, c1 - c0, kind="generator", props={"type": "actor", **props})
+        fade = min(_snap(rate, 0.4), (c1 - c0) // 3)
+        if fade_in:
+            ed.add_keyframe(cid, "opacity", 0, 0.0)
+            ed.add_keyframe(cid, "opacity", fade, 1.0)
+        ed.add_keyframe(cid, "opacity", c1 - c0 - fade, 1.0)
+        ed.add_keyframe(cid, "opacity", c1 - c0, 0.0)
+        n += 1
+
+    for sp, first, last, slot in stretches:
+        kit = KITS[plan.scenes[first].kit]
+        t0, t1 = starts[first], starts[last] + durs[last]
+        dur = t1 - t0
+        track = tracks[len(tracks) - 1 - slot]  # slot 0 (main character) drawn in front
+        hab = castmod.habitat(sp)
+        seed = 1 + sorted(actors.SPECIES).index(sp)  # same look in every scene
+        common = {"species": sp, "seed": seed}
+        if hab == "air":
+            size = 0.35 * base / 0.3 * actors.SCALE[sp]
+            speed = min(0.2, max(0.06, 1.25 / dur))
+            end = min(t1, t0 + 1.3 / speed)
+            props = {**common, "action": "fly", "x": -0.1, "y": 0.16 + 0.07 * slot,
+                     "size": size, "speed": speed}  # fmt: skip
+            clip(track, t0, end, props, False)
+            continue
+        if hab == "water":
+            size = base * actors.SCALE[sp] * (0.9 if sp != "whale" else 0.6)
+            speed = min(0.12, max(0.04, 1.2 / dur))
+            y = min(0.95, kit.water + (0.2 if kit.ground == 0 else 0.07) + 0.06 * slot)
+            props = {**common, "action": "swim", "x": -0.15, "size": size, "speed": speed,
+                     "y": y, "surface": kit.water}  # fmt: skip
+            clip(track, t0, min(t1, t0 + 1.4 / speed), props, False)
+            continue
+        ground_bird = sp in actors.BIRDS
+        size = max(0.06, base * actors.SCALE[sp] * (2.2 if ground_bird else 1.0))
+        y = min(kit.ground, 0.83) - 0.025 * slot
+        action = _action(plan.scenes[first].narration)
+        height_px = size * h
+        if ground_bird:
+            per_s = 0.5
+        elif action == "run":
+            per_s = 2.6 if sp in actors.QUADS else 1.8
+        else:
+            per_s = 1.1 if sp in actors.QUADS else 0.8
+        speed = per_s * height_px / w  # frame widths per second
+        x_stop = 0.36 - 0.13 * slot  # left of centre: clear of rivers and the campfire
+        props = {**common, "y": y, "size": size}
+        if action == "idle":
+            clip(track, t0, t1, {**props, "action": "idle", "x": x_stop, "speed": 0.0}, True)
+            continue
+        x0 = -0.12 - 0.12 * slot
+        if action == "run":
+            end = min(t1, t0 + (1.25 - x0) / speed)
+            clip(track, t0, end, {**props, "action": "run", "x": x0, "speed": speed}, False)
+            continue
+        t_walk = (x_stop - x0) / speed
+        if t_walk >= dur - 0.5:
+            clip(track, t0, t1, {**props, "action": "walk", "x": x0, "speed": speed}, False)
+            continue
+        walk_props = {**props, "action": "walk", "x": x0, "speed": speed}
+        c0, c1 = _snap(rate, t0), _snap(rate, t0 + t_walk)
+        ed.add_clip(track, c0, c1 - c0, kind="generator", props={"type": "actor", **walk_props})
+        n += 1
+        idle = {**props, "action": "idle", "x": x_stop, "speed": 0.0, "facing": "right"}
+        cid = ed.add_clip(
+            track, c1, _snap(rate, t1) - c1, kind="generator", props={"type": "actor", **idle}
+        )
+        fade = _snap(rate, 0.4)
+        ed.add_keyframe(cid, "opacity", _snap(rate, t1) - c1 - fade, 1.0)
+        ed.add_keyframe(cid, "opacity", _snap(rate, t1) - c1, 0.0)
+        n += 1
+    return n
+
+
 def assemble(
     plan: StoryPlan,
     root: Path,
@@ -128,9 +280,9 @@ def assemble(
         ed = Editor(p.con)
         n_layers = max(len(KITS[s.kit].layers) for s in plan.scenes)
         vtracks = [p.con.execute("SELECT id FROM track WHERE kind='video'").fetchone()[0]]
-        while len(vtracks) < n_layers + 2:
+        while len(vtracks) < n_layers + MAX_CAST + 2:
             vtracks.append(ed.add_track("video"))
-        title_t, sub_t = vtracks[n_layers], vtracks[n_layers + 1]
+        title_t, sub_t = vtracks[n_layers + MAX_CAST], vtracks[n_layers + MAX_CAST + 1]
         dia_t = p.con.execute("SELECT id FROM track WHERE kind='audio'").fetchone()[0]
         amb_t, mus_t = ed.add_track("audio", "Ambience"), ed.add_track("audio", "Music")
         ed.set_track(amb_t, bus="ambience")
@@ -195,6 +347,13 @@ def assemble(
             alen = min(c1 - c0, _snap_down(rate, _asset_len(p, aid)))
             cid = ed.add_clip(amb_t, c0, alen, asset_id=aid, gain_db=-14.0)
             ed.set_props(cid, fade_in=min(1.0, (r1 - r0) / 3), fade_out=min(1.0, (r1 - r0) / 3))
+
+        # 2b. characters: one clip per species per stretch of consecutive scenes it is in
+        n_actor_clips = _place_cast(
+            ed, plan, starts, durs, runs, rate, vtracks[n_layers : n_layers + MAX_CAST], w, h
+        )
+        if n_actor_clips:
+            say(f"characters: {n_actor_clips} animated clip(s)")
 
         # 3. music: one bed in the story's dominant mood
         mood = Counter(s.mood for s in plan.scenes).most_common(1)[0][0]
@@ -265,7 +424,7 @@ def assemble(
                         "box": True,
                         "box_opacity": 0.55,
                         "box_padding": round(14 * k),
-                        "y": round(0.36 * h),
+                        "y": round(0.41 * h),
                         "line_spacing": 1.15,
                     },
                 )

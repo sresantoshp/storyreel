@@ -147,7 +147,17 @@ GENERATORS: dict[str, dict[str, Any]] = {
     },
     "snow": {"count": 500, "speed": 90.0, "size": 3.0, "sway": 30.0, "opacity": 0.9, "seed": 1},
     "fog": {"density": 0.45, "speed": 25.0, "scale": 260.0, "color": "#c8ccd4", "seed": 1},
-    "fire": {"height": 0.35, "speed": 220.0, "intensity": 1.0, "seed": 1},
+    # width 0 = a band of flame across the whole frame; >0 = one campfire of that width
+    # (fraction of frame width) centred at x, with logs, its base at `base` (fraction of height)
+    "fire": {
+        "height": 0.35,
+        "speed": 220.0,
+        "intensity": 1.0,
+        "width": 0.0,
+        "x": 0.5,
+        "base": 0.9,
+        "seed": 1,
+    },
     "particles": {
         "count": 120,
         "size": 14.0,
@@ -183,6 +193,117 @@ GENERATORS: dict[str, dict[str, Any]] = {
     },
     "birds": {"count": 7, "size": 26.0, "speed": 90.0, "color": "#1d1d24", "flap": 3.0, "seed": 4},
 }
+
+# Illustrated environments (render/scenery.py) and animated characters (render/actors.py)
+SCENERY_DEFAULTS: dict[str, dict[str, Any]] = {
+    "sky": {
+        "top": "#4f94dc",
+        "bottom": "#cfe6f6",
+        "body": "sun",  # sun | moon | none
+        "body_x": 0.78,
+        "body_y": 0.18,
+        "body_size": 0.06,
+        "body_color": "#fff3c4",
+        "glow": 0.5,
+        "clouds": 5,
+        "cloud_speed": 10.0,
+        "cloud_color": "#ffffff",
+        "cloud_opacity": 0.92,
+        "stars": 0,
+        "seed": 1,
+    },
+    "sea": {
+        "horizon": 0.58,
+        "far": "#8cc2e2",
+        "near": "#1b5c8a",
+        "waves": 90,
+        "speed": 1.0,
+        "glitter": 0.6,
+        "glitter_x": 0.78,
+        "seed": 1,
+    },
+    "beach": {
+        "shore": 0.74,
+        "slope": 0.04,
+        "sand": "#ecd6a4",
+        "sand_near": "#d9b77c",
+        "wet": "#b99a6a",
+        "foam": "#ffffff",
+        "tide": 0.025,
+        "period": 7.0,
+        "seed": 1,
+    },
+    "hills": {
+        "layers": 3,
+        "far": "#a9cfa4",
+        "near": "#3d7a3b",
+        "horizon": 0.64,
+        "height": 0.26,
+        "tea": 0.0,  # 0..1: terraced tea-garden rows on the nearest hill
+        "houses": 0,  # little hill-station houses on the middle hill
+        "wall": "#f4ead8",
+        "roof": "#b4513a",
+        "lit": 0.0,
+        "seed": 5,
+    },
+    "trees": {
+        "style": "pine",  # pine | round | palm | jungle | bamboo | mixed
+        "count": 12,
+        "rows": 2,
+        "base": 0.66,
+        "size": 0.3,
+        "color": "#2f6b3a",
+        "trunk": "#5a3d26",
+        "haze": "#b8d4e6",
+        "side": "both",  # both | left | right | spread
+        "seed": 7,
+    },
+    "grass": {
+        "height": 0.07,
+        "density": 280,
+        "color": "#4b8636",
+        "tip": "#9ccc6c",
+        "sway": 1.0,
+        "flowers": 0,
+        "flower_colors": "#ffffff,#ffd84a,#ff6f91,#b48cff",
+        "seed": 9,
+    },
+    "ice": {
+        "horizon": 0.6,
+        "ice": "#e4f1f8",
+        "shade": "#a3c6dc",
+        "bergs": 4,
+        "cracks": 16,
+        "glint": 0.7,
+        "seed": 11,
+    },
+    "houses": {
+        "count": 5,
+        "base": 0.68,
+        "size": 0.07,
+        "style": "cottage",  # cottage | hut
+        "wall": "#efe2cc",
+        "roof": "#a8452f",
+        "lit": 0.0,  # 0 = day, 1 = windows glow (night)
+        "spread": 0.8,
+        "seed": 13,
+    },
+}
+
+ACTOR_DEFAULTS: dict[str, Any] = {
+    "species": "fox",
+    "action": "walk",
+    "x": 0.2,
+    "y": 0.8,
+    "size": 0.2,
+    "speed": 0.06,
+    "facing": "auto",  # auto | left | right
+    "surface": 0.0,  # 0 = none; else water line (fraction of height)
+    "seed": 1,
+}
+
+GENERATORS.update(SCENERY_DEFAULTS)
+GENERATORS["actor"] = ACTOR_DEFAULTS
 
 TEXT_DEFAULTS: dict[str, Any] = {
     "text": "",
