@@ -171,7 +171,7 @@ class Translator:
                 batch, padding="longest", truncation=True, max_length=256, return_tensors="pt"
             )
             with self.torch.inference_mode():
-                gen = self.model.generate(**enc, num_beams=beams, max_length=256, use_cache=True)
+                gen = self.model.generate(**enc, num_beams=beams, max_length=256, use_cache=False)
             decoded = self.tok.batch_decode(
                 gen, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
