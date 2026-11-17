@@ -5,12 +5,14 @@ Each probe has a timeout and degrades to "unknown" instead of failing the whole 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -185,6 +187,42 @@ def disk_bench(directory: Path, *, total_bytes: int = 256 * MB) -> DiskBench:
     return DiskBench(str(directory), free, written / MB / dt, written)
 
 
+def run_with_peak(argv: list[str], timeout_s: float) -> tuple[int, str, float, int, bool]:
+    """Run a child to completion; return (exit code, stderr, wall s, peak RSS bytes, timed out).
+
+    The peak is exact, not sampled: POSIX takes ru_maxrss from wait4() on exit; Windows
+    reads the process's own peak working-set counter, which keeps the maximum even if the
+    process lives only a few milliseconds (sampling missed it on a fast CI machine).
+    """
+    t0 = time.perf_counter()
+    with subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as p:
+        killed = threading.Event()
+
+        def _kill() -> None:
+            killed.set()
+            p.kill()
+
+        timer = threading.Timer(timeout_s, _kill)
+        timer.start()
+        peak = 0
+        try:
+            if sys.platform == "win32":
+                ps = psutil.Process(p.pid)
+                while p.poll() is None:
+                    with contextlib.suppress(psutil.Error):
+                        peak = max(peak, int(ps.memory_info().peak_wset))
+                    time.sleep(0.01)
+            else:
+                _, status, usage = os.wait4(p.pid, 0)
+                p.returncode = os.waitstatus_to_exitcode(status)
+                peak = int(usage.ru_maxrss) * (1 if sys.platform == "darwin" else 1024)
+        finally:
+            timer.cancel()
+        wall = time.perf_counter() - t0
+        stderr = p.stderr.read().decode("utf-8", "replace") if p.stderr else ""
+    return int(p.returncode or 0), stderr, wall, peak, killed.is_set()
+
+
 def encode_bench(
     ffmpeg: Path,
     *,
@@ -220,22 +258,9 @@ def encode_bench(
         argv += ["-preset", "veryfast", "-crf", "20"]
     argv += ["-f", "null", "-"]
 
-    peak = 0
-    t0 = time.perf_counter()
-    with subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as p:
-        ps = psutil.Process(p.pid)
-        while p.poll() is None:
-            try:
-                peak = max(peak, ps.memory_info().rss)
-            except psutil.NoSuchProcess:
-                break
-            if time.perf_counter() - t0 > timeout_s:
-                p.kill()
-                p.wait()
-                raise StoryReelError(f"Encoder benchmark ({encoder}) took over {timeout_s:.0f} s")
-            time.sleep(0.05)
-        wall = time.perf_counter() - t0
-        stderr = p.stderr.read().decode("utf-8", "replace") if p.stderr else ""
-    if p.returncode != 0:
+    rc, stderr, wall, peak, timed_out = run_with_peak(argv, timeout_s)
+    if timed_out:
+        raise StoryReelError(f"Encoder benchmark ({encoder}) took over {timeout_s:.0f} s")
+    if rc != 0:
         raise StoryReelError(f"Encoder benchmark ({encoder}) failed: {stderr.strip()[-300:]}")
     return EncodeBench(encoder, width, height, frames, wall, frames / wall, peak)
