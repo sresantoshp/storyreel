@@ -90,8 +90,12 @@ def _check_value(name: str, value: Any, default: Any) -> None:
         ok = isinstance(value, list)
     if not ok:
         raise EditError(f"Parameter {name} must be a {type(default).__name__}.")
-    if isinstance(default, str) and default.startswith("#") and not _HEX.match(str(value)):
-        raise EditError(f"Parameter {name} must be a color like #1a2b3c.")
+    if isinstance(default, str) and default.startswith("#"):
+        many = "," in default  # a list of colours, e.g. flower_colors
+        parts = str(value).split(",") if many else [str(value)]
+        if not all(_HEX.match(c.strip()) for c in parts):
+            example = "#ffffff,#ffd84a" if many else "#1a2b3c"
+            raise EditError(f"Parameter {name} must be a color like {example}.")
 
 
 def _check_range(name: str, value: Any, rng: tuple[float, float] | None) -> None:

@@ -10,6 +10,7 @@ import pytest
 
 from conftest import Media
 from storyreel.project import store
+from storyreel.project.edits import _check_value
 from storyreel.render import actors, scenery
 from storyreel.render.fxspec import GENERATORS
 from storyreel.render.generators import Generator
@@ -82,6 +83,8 @@ def test_kits_use_registered_generators_and_known_params() -> None:
         for gtype, params in kit.layers:
             assert gtype in GENERATORS
             assert set(params) <= set(GENERATORS[gtype]), (kit.name, gtype)
+            for k, v in params.items():  # the same value check the editor applies
+                _check_value(k, v, GENERATORS[gtype][k])
 
 
 # -- casting -----------------------------------------------------------------------------
@@ -146,3 +149,19 @@ def test_story_places_characters(tmp_path: Path, media: Media) -> None:
     dog = [a for a in acts if a[3]["species"] == "dog"]
     assert 1 <= len(dog) <= 2 and min(d[1] for d in dog) > fox[0][1]  # joins in scene 2
     assert {a[3]["seed"] for a in fox} == {fox[0][3]["seed"]}  # same look throughout
+
+
+def test_every_kit_assembles_with_characters(tmp_path: Path, media: Media) -> None:
+    scenes = []
+    for name, kit in KITS.items():
+        who = "A dolphin swam." if kit.ground == 0 else "The girl and her dog walked."
+        scenes.append(Scene(who, name, "calm"))
+    plan = plan_story(PlanRequest("x.", mode="script"))
+    plan.scenes = scenes
+    cast.assign(plan.scenes, "a girl")
+    speak, amb, mus = stand_ins(media.ffmpeg)
+    res = assemble.assemble(
+        plan, tmp_path / "all.storyreel", speak=speak, ambience=amb, music=mus,
+        ffmpeg=media.ffmpeg, ffprobe=media.ffprobe, height=180,
+    )  # fmt: skip
+    assert res.runs == len(KITS)
