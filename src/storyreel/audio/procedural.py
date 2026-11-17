@@ -30,18 +30,37 @@ import os
 import wave
 import zlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
 
-from storyreel.audio import ir
+from storyreel.audio import ir, sfx
 from storyreel.errors import StoryReelError
 
 F64 = npt.NDArray[np.float64]
 Gen = np.random.Generator
 
-AMBIENCES = ("rain", "wind", "fire", "river", "birds", "night", "room")
+AMBIENCES = (
+    "rain",
+    "wind",
+    "fire",
+    "river",
+    "birds",
+    "night",
+    "room",
+    "ocean",
+    "beach",
+    "jungle",
+    "forest",
+    "thunderstorm",
+    "ice",
+    "waterfall",
+    "hill_station",
+    "village",
+    "stream",
+)
 MOODS = ("calm", "happy", "sad", "tense", "mysterious", "epic")
 
 MAX_SECONDS = 6 * 3600.0
@@ -137,9 +156,14 @@ class _Events:
 
     def add(self, pos: int, mono: F64, pan: float) -> None:
         n = min(mono.size, self.max_len)
+        seg = mono[:n]
+        if mono.size > n:  # too long for the carry buffer: fade out instead of cutting
+            m = min(n, 512)
+            seg = seg.copy()
+            seg[n - m :] *= np.linspace(1.0, 0.0, m)
         gl, gr = _pan(pan)
-        self.buf[pos : pos + n, 0] += mono[:n] * gl
-        self.buf[pos : pos + n, 1] += mono[:n] * gr
+        self.buf[pos : pos + n, 0] += seg * gl
+        self.buf[pos : pos + n, 1] += seg * gr
 
     def take(self) -> F64:
         out = self.buf[: self.block].copy()
@@ -169,11 +193,12 @@ class _SpectralNoise:
         k = _FRAMES_PER_BLOCK
         t = (self.frame + np.arange(k)) * _HOP / self.sr
         self.frame += k
-        mag = self.shape(self.freqs, t)  # (k, bins)
+        mag = self.shape(self.freqs, t)  # (k, bins) or (k, bins, 2) for per-channel shapes
         bins = self.freqs.size
         re = self.rng.standard_normal((k, bins, 2))
         im = self.rng.standard_normal((k, bins, 2))
-        spec = (re + 1j * im) * (mag[:, :, None] * self.scale)
+        m3 = mag[:, :, None] if mag.ndim == 2 else mag
+        spec = (re + 1j * im) * (m3 * self.scale)
         spec[:, 0, :] = 0.0
         frames = np.fft.irfft(spec, n=_N, axis=1) * self.win  # (k, N, 2)
         first, second = frames[:, :_HOP, :], frames[:, _HOP:, :]
@@ -212,7 +237,7 @@ def _decay_tone(sr: int, f0: float, tau: float, length: float, rise: float = 0.0
 
 
 def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
-    r = _rngs(seed, "amb:" + kind, 8)
+    r = _rngs(seed, "amb:" + kind, 48)  # spawn(n) children don't depend on n
     layers: list[Layer] = []
 
     def noise(rng: Gen, shape: Callable[[F64, F64], F64]) -> Layer:
@@ -220,28 +245,7 @@ def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
         return lambda _s0: src.block()
 
     if kind == "rain":
-        inten = _Smooth(r[0], 3.0, 0.75, 1.1)
-
-        def rain_shape(f: F64, t: F64) -> F64:
-            base = _norm(_band(f, 500, 9000, 2.0) + 0.35 * _band(f, 80, 450, 2.0))
-            return 0.07 * inten.at(t)[:, None] * base[None, :]
-
-        layers.append(noise(r[1], rain_shape))
-        drops = _Events(_BLOCK, int(0.05 * sr))
-        drng, prng = r[2], r[3]
-
-        def drop_layer(s0: int) -> F64:
-            for pos in _poisson_positions(drng, 45.0, sr):
-                amp = math.exp(drng.uniform(math.log(0.015), math.log(0.12)))
-                tone = _decay_tone(sr, drng.uniform(2200, 7500), drng.uniform(0.0012, 0.004), 0.03)
-                drops.add(int(pos), amp * tone, drng.uniform(-0.9, 0.9))
-            for pos in _poisson_positions(prng, 4.0, sr):  # "plip": rising bubble on water
-                amp = prng.uniform(0.04, 0.14)
-                tone = _decay_tone(sr, prng.uniform(900, 2200), 0.007, 0.04, rise=0.6)
-                drops.add(int(pos), amp * tone, prng.uniform(-0.8, 0.8))
-            return drops.take()
-
-        layers.append(drop_layer)
+        layers += _rain(r[0], r[1], r[2], r[3], sr)
     elif kind == "wind":
         gust = _Smooth(r[0], 2.2, 0.0, 1.0)
         slow = _Smooth(r[1], 9.0, 0.6, 1.0)
@@ -332,18 +336,24 @@ def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
             return out
 
         layers.append(noise(r[1], leaves))
-        ev = _Events(_BLOCK, int(1.6 * sr))
-        cr = r[2]
-        species = [_bird_species(r[3 + i]) for i in range(3)]
-
-        def call_layer(_s0: int) -> F64:
-            for pos in _poisson_positions(cr, 0.7, sr):
-                sp = species[int(cr.integers(0, len(species)))]
-                call = sp(cr, sr)
-                ev.add(int(pos), cr.uniform(0.04, 0.2) * call, cr.uniform(-0.9, 0.9))
-            return ev.take()
-
-        layers.append(call_layer)
+        # five resident songbirds, each its own species, singing bouts from its own spot
+        styles = r[2].permutation(len(sfx.SONGBIRDS))[:5]
+        birds = [
+            _Singer(
+                r[3 + i],
+                sfx.songbird(r[3 + i], sfx.SONGBIRDS[int(st)]),
+                sr,
+                gain=float(r[3 + i].uniform(0.06, 0.2)),
+                pan=float(r[3 + i].uniform(-0.9, 0.9)),
+                cutoff=float(r[3 + i].choice([0.0, 0.0, 6000.0])),
+                bout=(2, 6),
+                gap=(0.6, 3.0),
+                rest=(3.0, 15.0),
+                first=(0.0, 4.0),
+            )
+            for i, st in enumerate(styles)
+        ]
+        layers.append(_wet(_chorus(birds, 2.0, sr), "hall", 0.15, sr))
     elif kind == "night":
         base = _norm(_band(_freqs(sr), 40, 600, 1.5))
         drift = _Smooth(r[0], 6.0, 0.6, 1.0)
@@ -353,8 +363,21 @@ def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
             return out
 
         layers.append(noise(r[1], night_air))
-        crickets = [_cricket(r[2 + i], sr, i) for i in range(4)]
+        crickets = [_gated(_cricket(r[2 + i], sr, i), r[10 + i], sr) for i in range(4)]
         layers.append(lambda s0: np.sum([c(s0) for c in crickets], axis=0))
+        owl = _Singer(
+            r[6],
+            sfx.hoot(r[6]),
+            sr,
+            gain=0.05,
+            pan=float(r[6].uniform(-0.8, 0.8)),
+            cutoff=1800.0,
+            bout=(1, 3),
+            gap=(3.0, 8.0),
+            rest=(20.0, 60.0),
+            first=(2.0, 25.0),
+        )
+        layers.append(_wet(_chorus([owl], 2.0, sr), "hall", 0.3, sr))
     elif kind == "room":
         hvac = _norm(_band(_freqs(sr), 40, 180, 2.0))
         tone = _norm(_band(_freqs(sr), 40, 3500, 1.0) / np.sqrt(np.maximum(_freqs(sr), 40.0)))
@@ -373,6 +396,8 @@ def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
             return out
 
         layers.append(hum)
+    elif kind in _RECIPES:
+        layers += _RECIPES[kind](r, sr)
     else:
         raise ProceduralError(
             f"Unknown ambience {kind!r}.", fix=f"Choose one of: {', '.join(AMBIENCES)}."
@@ -443,6 +468,749 @@ def _cricket(rng: Gen, sr: int, i: int) -> Layer:
         return out
 
     return layer
+
+
+# -- environment building blocks -----------------------------------------------------------
+def _rain(
+    ri: Gen,
+    rn: Gen,
+    rd: Gen,
+    rp: Gen,
+    sr: int,
+    level: float = 0.07,
+    low: float = 0.35,
+    drops: float = 45.0,
+    plips: float = 4.0,
+) -> list[Layer]:
+    """Rain hiss (+ low roar) with individual drops and water "plips"."""
+    inten = _Smooth(ri, 3.0, 0.75, 1.1)
+
+    def rain_shape(f: F64, t: F64) -> F64:
+        base = _norm(_band(f, 500, 9000, 2.0) + low * _band(f, 80, 450, 2.0))
+        out: F64 = level * inten.at(t)[:, None] * base[None, :]
+        return out
+
+    src = _SpectralNoise(rn, sr, rain_shape)
+    ev = _Events(_BLOCK, int(0.05 * sr))
+
+    def drop_layer(_s0: int) -> F64:
+        for pos in _poisson_positions(rd, drops, sr):
+            amp = math.exp(rd.uniform(math.log(0.015), math.log(0.12)))
+            tone = _decay_tone(sr, rd.uniform(2200, 7500), rd.uniform(0.0012, 0.004), 0.03)
+            ev.add(int(pos), amp * tone, rd.uniform(-0.9, 0.9))
+        for pos in _poisson_positions(rp, plips, sr):  # "plip": rising bubble on water
+            amp = rp.uniform(0.04, 0.14)
+            tone = _decay_tone(sr, rp.uniform(900, 2200), 0.007, 0.04, rise=0.6)
+            ev.add(int(pos), amp * tone, rp.uniform(-0.8, 0.8))
+        return ev.take()
+
+    return [lambda _s0: src.block(), drop_layer]
+
+
+class _Singer:
+    """One animal (or bell, or cow) at a fixed place: a bout of calls with short gaps,
+    then a longer rest. Every call is re-synthesised, so no two are identical; distance
+    is a low-pass `cutoff` and a lower `gain`."""
+
+    def __init__(
+        self,
+        rng: Gen,
+        call: sfx.Call,
+        sr: int,
+        *,
+        gain: float,
+        pan: float,
+        cutoff: float = 0.0,
+        bout: tuple[int, int] = (1, 4),
+        gap: tuple[float, float] = (1.0, 4.0),
+        rest: tuple[float, float] = (5.0, 30.0),
+        first: tuple[float, float] = (0.0, 10.0),
+        busy: float = 1.0,
+    ) -> None:
+        self.rng, self.call, self.sr = rng, call, sr
+        self.gain, self.pan, self.cutoff = gain, pan, cutoff
+        self.bout, self.gap, self.rest, self.busy = bout, gap, rest, busy
+        self.next = float(rng.uniform(*first))
+        self.left = int(rng.integers(bout[0], bout[1] + 1))
+
+    def fill(self, ev: _Events, s0: int) -> None:
+        r, sr = self.rng, self.sr
+        while int(self.next * sr) < s0 + _BLOCK:
+            pos = max(0, int(self.next * sr) - s0)
+            x = self.call(r, sr)
+            if self.cutoff:
+                x = sfx.lowpass(x, sr, self.cutoff)
+            amp = self.gain * r.uniform(0.6, 1.0)
+            ev.add(pos, amp * x, float(np.clip(self.pan + r.uniform(-0.08, 0.08), -1, 1)))
+            self.left -= 1
+            span = self.busy * x.size / sr
+            if self.left > 0:
+                self.next += span + r.uniform(*self.gap)
+            else:
+                self.left = int(r.integers(self.bout[0], self.bout[1] + 1))
+                self.next += span + r.uniform(*self.rest)
+
+
+def _chorus(singers: list[_Singer], max_s: float, sr: int) -> Layer:
+    ev = _Events(_BLOCK, int(max_s * sr))
+
+    def layer(s0: int) -> F64:
+        for s in singers:
+            s.fill(ev, s0)
+        return ev.take()
+
+    return layer
+
+
+def _wet(layer: Layer, room: str, mix: float, sr: int) -> Layer:
+    """Send one layer through the procedural reverb (distance, forest/valley echo)."""
+    rv = _Reverb(room, sr, mix)
+    return lambda s0: rv.process(layer(s0))
+
+
+def _gated(layer: Layer, rng: Gen, sr: int) -> Layer:
+    """An insect that stops and starts: a slow random gate (smooth, 0..1)."""
+    g = _Smooth(rng, float(rng.uniform(7.0, 14.0)), -0.4, 1.8)
+
+    def out(s0: int) -> F64:
+        t = (s0 + np.arange(_BLOCK)) / sr
+        v = np.clip(g.at(t), 0.0, 1.0)
+        res: F64 = layer(s0) * (v * v * (3 - 2 * v))[:, None]
+        return res
+
+    return out
+
+
+@dataclass
+class _Swell:
+    start: float
+    dur: float
+    gains: tuple[float, float]
+    power: Callable[[F64], F64]  # local times (k,), clipped to [0, dur] -> (k, bins) power
+
+
+class _Swells:
+    """Long noise events (waves, thunder rolls, cicada choruses) evaluated per spectral
+    frame. `spawn(t)` builds the event starting at t and returns the time to the next
+    start, so events are made in time order and dropped once finished; their powers add
+    (they are independent noises), giving a per-channel magnitude for _SpectralNoise."""
+
+    def __init__(self, spawn: Callable[[float], tuple[_Swell, float]], first: float) -> None:
+        self.spawn, self.next_t = spawn, first
+        self.active: list[_Swell] = []
+
+    def ensure(self, t_end: float) -> None:
+        while self.next_t <= t_end:
+            sw, gap = self.spawn(self.next_t)
+            self.active.append(sw)
+            self.next_t += max(gap, 0.05)
+
+    def power(self, t: F64, bins: int) -> F64:
+        self.ensure(float(t[-1]))
+        acc = np.zeros((t.size, bins, 2))
+        keep: list[_Swell] = []
+        for sw in self.active:
+            tl = t - sw.start
+            on = (tl >= 0) & (tl <= sw.dur)
+            if np.any(on):
+                p = sw.power(np.clip(tl, 0.0, sw.dur)) * on[:, None]
+                acc[:, :, 0] += p * sw.gains[0] ** 2
+                acc[:, :, 1] += p * sw.gains[1] ** 2
+            if sw.start + sw.dur >= t[-1]:
+                keep.append(sw)
+        self.active = keep
+        return acc
+
+
+def _rownorm(m: F64) -> F64:
+    out: F64 = m / np.maximum(1e-12, np.sqrt(np.mean(m**2, axis=1, keepdims=True)))
+    return out
+
+
+def _breeze(
+    rg: Gen,
+    rs: Gen,
+    rn: Gen,
+    sr: int,
+    level: float,
+    fc: tuple[float, float] = (250.0, 1100.0),
+    whistle: float = 2.0,
+    period: float = 2.6,
+) -> Layer:
+    """Wind in gusts: brighter and louder as each gust rises (a lighter `wind`)."""
+    gust = _Smooth(rg, period, 0.0, 1.0)
+    slow = _Smooth(rs, 9.0, 0.6, 1.0)
+
+    def shape(f: F64, t: F64) -> F64:
+        g = gust.at(t)[:, None] ** 1.5
+        amp = (0.35 + 0.65 * g) * slow.at(t)[:, None]
+        body = _band(f[None, :], 60.0, 16000.0, 2.0) / np.maximum(f[None, :], 60.0) ** 0.3
+        lp = 1.0 / np.sqrt(1.0 + (f[None, :] / (fc[0] + (fc[1] - fc[0]) * g)) ** 4)
+        mag = body * lp * (1.0 + whistle * g * _peak(f[None, :], 450.0 + 800.0 * g, 10.0))
+        out: F64 = level * amp * _rownorm(mag)
+        return out
+
+    src = _SpectralNoise(rn, sr, shape)
+    return lambda _s0: src.block()
+
+
+def _bed(rng: Gen, sr: int, level: float, lo: float, hi: float, period: float = 6.0) -> Layer:
+    """Steady air/surf bed with a slow drift."""
+    drift = _Smooth(rng, period, 0.65, 1.0)
+    base = _norm(_band(_freqs(sr), lo, hi, 1.5))
+
+    def shape(_f: F64, t: F64) -> F64:
+        out: F64 = level * drift.at(t)[:, None] * base[None, :]
+        return out
+
+    src = _SpectralNoise(rng, sr, shape)
+    return lambda _s0: src.block()
+
+
+def _waves(
+    rw: Gen,
+    rn: Gen,
+    sr: int,
+    *,
+    level: float,
+    gap: tuple[float, float],
+    dur: tuple[float, float],
+    crash: float,
+    foam: float,
+    spread: float = 0.6,
+) -> Layer:
+    """Ocean swells: each wave builds (a dark rumble that brightens as it steepens), crashes
+    (broadband burst) and washes up as fizzing foam that slides back; waves overlap and
+    differ in size, length, timing and position."""
+    f = _freqs(sr)
+    body = _band(f, 35, 20000, 2.0)[None, :]
+    crash_s = (_norm(_band(f, 80, 12000, 2.0) / np.maximum(f, 80.0) ** 0.25) ** 2)[None, :]
+    foam_b = _band(f, 900, 16000, 2.0)[None, :]
+
+    def spawn(t0: float) -> tuple[_Swell, float]:
+        d = rw.uniform(*dur)
+        tc = d * rw.uniform(0.35, 0.55)
+        big = level * math.exp(rw.normal(0.0, 0.3))
+        bright = rw.uniform(0.7, 1.3)
+        tw = (d - tc) / rw.uniform(2.0, 3.0)
+        tcr = rw.uniform(0.4, 0.9)
+        fade = max(0.5, min(1.5, d - tc))
+
+        def power(tl: F64) -> F64:
+            xb = np.clip(tl / tc, 0.0, 1.0)
+            after = np.maximum(tl - tc, 0.0)
+            a_b = xb**2 * np.exp(-after / 0.6)
+            fc_b = 200.0 + 1200.0 * bright * xb[:, None]
+            sb = _rownorm(body / np.sqrt(1.0 + (f[None, :] / fc_b) ** 4))
+            rise = np.clip((tl - (tc - 0.35)) / 0.35, 0.0, 1.0) ** 2
+            a_c = crash * rise * np.exp(-after / tcr)
+            a_f = foam * (1.0 - np.exp(-after / 0.3)) * np.exp(-after / tw)
+            fc_f = 2500.0 + 9000.0 * bright * np.exp(-after / (2.0 * tw))
+            sf = _rownorm(foam_b / np.sqrt(1.0 + (f[None, :] / fc_f[:, None]) ** 4))
+            grain = 0.5 + rw.random((tl.size, 1))  # fizz: frame-to-frame flicker
+            end = np.clip((d - tl) / fade, 0.0, 1.0) ** 2
+            p = (
+                (a_b**2)[:, None] * 0.5 * sb**2
+                + (a_c**2)[:, None] * crash_s
+                + (a_f**2)[:, None] * grain * sf**2
+            )
+            out: F64 = ((big * end) ** 2)[:, None] * p
+            return out
+
+        return _Swell(t0, d, _pan(rw.uniform(-spread, spread)), power), rw.uniform(*gap)
+
+    sw = _Swells(spawn, rw.uniform(0.0, 2.0))
+    src = _SpectralNoise(rn, sr, lambda fr, t: np.sqrt(sw.power(t, fr.size)))
+    return lambda _s0: src.block()
+
+
+class _Thunder:
+    """Lightning strikes at random: distant ones are slow, low rolling rumbles; close ones
+    start with a tearing crack (sample-accurate) and a heavier, brighter rumble."""
+
+    def __init__(
+        self, rng: Gen, rn: Gen, sr: int, gap: tuple[float, float], close_p: float
+    ) -> None:
+        self.rng, self.sr, self.gap, self.close_p = rng, sr, gap, close_p
+        self.f = _freqs(sr)
+        self.body = _band(self.f, 18.0, 20000.0, 2.0)[None, :] / np.maximum(self.f, 30.0) ** 0.5
+        self.swells = _Swells(self._spawn, rng.uniform(1.0, 6.0))
+        self.cracks: list[tuple[float, float, float]] = []
+        self.ev = _Events(_BLOCK, int(1.0 * sr))
+        self.src = _SpectralNoise(rn, sr, lambda fr, t: np.sqrt(self.swells.power(t, fr.size)))
+
+    def _spawn(self, t0: float) -> tuple[_Swell, float]:
+        r = self.rng
+        close = bool(r.random() < self.close_p)
+        d = r.uniform(9.0, 16.0) if close else r.uniform(6.0, 13.0)
+        lvl = (0.4 if close else 0.18) * math.exp(r.normal(0.0, 0.3))
+        pan = float(r.uniform(-0.7, 0.7))
+        nb = int(r.integers(2, 7))
+        bt = np.sort(r.uniform(0.0, 0.55 * d, nb))
+        bt[0] = 0.0
+        ba = r.uniform(0.3, 1.0, nb)
+        ba[0] = 1.0
+        bdec = r.uniform(0.8, 2.5, nb)
+        batt = 0.04 if close else float(r.uniform(0.3, 1.2))
+        fc0 = r.uniform(900.0, 1600.0) if close else r.uniform(150.0, 380.0)
+        f, body = self.f, self.body
+
+        def power(tl: F64) -> F64:
+            e = np.zeros(tl.size)
+            for i in range(nb):
+                x = tl - bt[i]
+                rise = np.clip(x / batt, 0.0, 1.0) ** 2
+                e += ba[i] * rise * np.exp(-np.maximum(x, 0.0) / bdec[i])
+            e *= np.clip((d - tl) / 1.5, 0.0, 1.0)
+            fc = 60.0 + fc0 * np.exp(-tl / (d / 3.0))
+            s = _rownorm(body / np.sqrt(1.0 + (f[None, :] / fc[:, None]) ** 4))
+            out: F64 = ((lvl * e) ** 2)[:, None] * s**2
+            return out
+
+        if close:
+            self.cracks.append((t0, lvl, pan))
+        return _Swell(t0, d, _pan(pan), power), float(r.uniform(*self.gap))
+
+    def rumble(self, _s0: int) -> F64:
+        return self.src.block()
+
+    def crack(self, s0: int) -> F64:
+        sr = self.sr
+        self.swells.ensure((s0 + _BLOCK) / sr)
+        keep = []
+        for t0, lvl, pan in self.cracks:
+            if int(t0 * sr) < s0 + _BLOCK:
+                x = sfx.thunder_crack(self.rng, sr)
+                self.ev.add(max(0, int(t0 * sr) - s0), min(1.0, 1.5 * lvl) * x, pan)
+            else:
+                keep.append((t0, lvl, pan))
+        self.cracks = keep
+        return self.ev.take()
+
+
+def _cicada(rw: Gen, rn: Gen, sr: int, level: float) -> Layer:
+    """Cicada chorus: a narrow buzzing band, pulsed at 90-220 Hz, that swells up over
+    several seconds, holds, and dies away, then rests."""
+    fc = rw.uniform(3800.0, 7000.0)
+    rate = rw.uniform(90.0, 220.0)
+    syl = rw.uniform(6.0, 12.0) if rw.random() < 0.5 else 0.0
+    f = _freqs(sr)
+    spec = (_norm(_peak(f, fc, 3.0) * _band(f, 1500, 16000, 2.0)) ** 2)[None, :]
+
+    def spawn(t0: float) -> tuple[_Swell, float]:
+        d = rw.uniform(6.0, 18.0)
+        att = rw.uniform(0.25, 0.5) * d
+        rel = rw.uniform(1.0, 2.5)
+        lvl = level * rw.uniform(0.5, 1.0)
+
+        def power(tl: F64) -> F64:
+            e = lvl * np.minimum(1.0, tl / att) ** 2 * np.clip((d - tl) / rel, 0.0, 1.0)
+            out: F64 = (e**2)[:, None] * spec
+            return out
+
+        return _Swell(t0, d, _pan(rw.uniform(-0.8, 0.8)), power), d + rw.uniform(2.0, 18.0)
+
+    sw = _Swells(spawn, rw.uniform(0.0, 4.0))
+    src = _SpectralNoise(rn, sr, lambda fr, t: np.sqrt(sw.power(t, fr.size)))
+
+    def layer(s0: int) -> F64:
+        t = (s0 + np.arange(_BLOCK)) / sr
+        am = (0.5 + 0.5 * np.sin(2 * np.pi * rate * t)) ** 2
+        if syl:
+            am = am * (0.5 + 0.5 * np.sin(2 * np.pi * syl * t)) ** 0.5
+        out: F64 = src.block() * am[:, None]
+        return out
+
+    return layer
+
+
+def _katydid(rng: Gen, sr: int, amp: float) -> Layer:
+    """Fast insect pulse train (higher and quicker than the night crickets)."""
+    fc = rng.uniform(5500, 9000)
+    rate = rng.uniform(40, 70)
+    n_p = int(rng.integers(2, 8))
+    per = rng.uniform(0.25, 0.6)
+    off = rng.uniform(0, per)
+    gl, gr = _pan(rng.uniform(-0.9, 0.9))
+
+    def layer(s0: int) -> F64:
+        t = (s0 + np.arange(_BLOCK)) / sr
+        tau = np.mod(t + off, per)
+        on = tau < n_p / rate
+        pulse = np.sin(np.pi * np.mod(tau * rate, 1.0)) ** 2
+        x = amp * on * pulse * np.sin(2 * np.pi * fc * t)
+        out: F64 = np.stack([x * gl, x * gr], axis=1)
+        return out
+
+    return layer
+
+
+def _drips(rng: Gen, sr: int, spots: int, amp: float) -> Layer:
+    """Leaves dripping into puddles: a few spots, each with its own pitch and slowly
+    varying rhythm, that start and stop, plus stray drops."""
+    ev = _Events(_BLOCK, int(0.1 * sr))
+    # per spot: pitch, period, pan, next time, on (1) / off (0)
+    st = [
+        [
+            rng.uniform(700, 2200),
+            rng.uniform(0.8, 3.5),
+            rng.uniform(-0.8, 0.8),
+            rng.uniform(0, 3),
+            1.0,
+        ]
+        for _ in range(spots)
+    ]
+
+    def layer(s0: int) -> F64:
+        end = s0 + _BLOCK
+        for s in st:
+            while int(s[3] * sr) < end:
+                if s[4] > 0:
+                    a = amp * rng.uniform(0.5, 1.0)
+                    ev.add(max(0, int(s[3] * sr) - s0), a * sfx.drip(rng, sr, s[0]), s[2])
+                s[3] += s[1] * rng.uniform(0.8, 1.25)
+                if rng.random() < 0.06:  # this spot dries up, or starts again
+                    s[4] = 1.0 - s[4]
+                    s[1] = rng.uniform(0.8, 3.5)
+        for pos in _poisson_positions(rng, 0.4, sr):
+            x = sfx.drip(rng, sr, rng.uniform(600, 2600))
+            ev.add(int(pos), amp * rng.uniform(0.3, 0.8) * x, rng.uniform(-0.9, 0.9))
+        return ev.take()
+
+    return layer
+
+
+def _bubbles(
+    rng: Gen,
+    sr: int,
+    rate: Callable[[int], float],
+    f_lo: float,
+    f_hi: float,
+    amp: tuple[float, float],
+) -> Layer:
+    """Minnaert-model water bubbles (as in `river`), at a time-varying rate."""
+    ev = _Events(_BLOCK, int(0.08 * sr))
+
+    def layer(s0: int) -> F64:
+        for pos in _poisson_positions(rng, rate(s0), sr):
+            f0 = math.exp(rng.uniform(math.log(f_lo), math.log(f_hi)))
+            d = 0.043 * f0 + 0.0014 * f0**1.5
+            length = min(0.08, 5.0 / d)
+            tone = _decay_tone(sr, f0, 1.0 / d, length, rise=0.1 * d * length)
+            ev.add(int(pos), rng.uniform(*amp) * tone, rng.uniform(-0.85, 0.85))
+        return ev.take()
+
+    return layer
+
+
+def _rustle(rg: Gen, rn: Gen, sr: int, level: float) -> Layer:
+    """Leaves rustling as gusts pass: bright noise, flickering frame to frame."""
+    gust = _Smooth(rg, 1.8, 0.0, 1.0)
+    base = _norm(_band(_freqs(sr), 1200, 9000, 1.5))
+
+    def shape(_f: F64, t: F64) -> F64:
+        g = np.clip(gust.at(t) - 0.25, 0.0, 1.0)[:, None] ** 1.5
+        flick = 0.4 + 1.2 * rg.random((t.size, 1))
+        out: F64 = level * g * flick * base[None, :]
+        return out
+
+    src = _SpectralNoise(rn, sr, shape)
+    return lambda _s0: src.block()
+
+
+def _songbirds(
+    r: list[Gen],
+    base: int,
+    n: int,
+    sr: int,
+    gain: tuple[float, float],
+    cutoff: list[float],
+    rest: tuple[float, float],
+) -> list[_Singer]:
+    """`n` resident songbirds of different species, uses generators r[base .. base+n]."""
+    order = r[base].permutation(len(sfx.SONGBIRDS))
+    out = []
+    for i in range(n):
+        g = r[base + 1 + i]
+        style = sfx.SONGBIRDS[int(order[i % len(order)])]
+        out.append(
+            _Singer(
+                g,
+                sfx.songbird(g, style),
+                sr,
+                gain=float(g.uniform(*gain)),
+                pan=float(g.uniform(-0.9, 0.9)),
+                cutoff=float(g.choice(cutoff)),
+                bout=(2, 6),
+                gap=(0.8, 4.0),
+                rest=rest,
+                first=(0.0, 6.0),
+            )
+        )
+    return out
+
+
+def _caller(
+    rng: Gen,
+    call: sfx.Call,
+    sr: int,
+    gain: float,
+    cutoff: float,
+    rest: tuple[float, float],
+    gap: tuple[float, float] = (3.0, 8.0),
+    first: tuple[float, float] = (2.0, 20.0),
+) -> _Singer:
+    """An occasional caller (owl, cuckoo, rooster...) somewhere around the listener."""
+    pan = float(rng.uniform(-0.9, 0.9))
+    return _Singer(
+        rng,
+        call,
+        sr,
+        gain=gain,
+        pan=pan,
+        cutoff=cutoff,
+        bout=(1, 3),
+        gap=gap,
+        rest=rest,
+        first=first,
+    )
+
+
+# -- environment recipes -------------------------------------------------------------------
+def _amb_ocean(r: list[Gen], sr: int) -> list[Layer]:
+    return [
+        _bed(r[0], sr, 0.015, 30.0, 500.0, 8.0),  # far surf
+        _waves(r[1], r[2], sr, level=0.06, gap=(4.5, 9.0), dur=(6.0, 12.0), crash=1.0, foam=1.0),
+        _breeze(r[3], r[4], r[5], sr, 0.012),
+    ]
+
+
+def _amb_beach(r: list[Gen], sr: int) -> list[Layer]:
+    gulls = [
+        _Singer(
+            r[10 + i],
+            sfx.gull(r[10 + i]),
+            sr,
+            gain=float(r[10 + i].uniform(0.05, 0.12)),
+            pan=float(r[10 + i].uniform(-0.9, 0.9)),
+            cutoff=float(r[10 + i].choice([0.0, 4500.0])),
+            bout=(1, 4),
+            gap=(0.6, 3.0),
+            rest=(8.0, 35.0),
+            first=(0.5, 12.0),
+        )
+        for i in range(3)
+    ]
+    return [
+        _bed(r[0], sr, 0.008, 30.0, 400.0, 8.0),
+        _waves(r[1], r[2], sr, level=0.045, gap=(5.0, 10.0), dur=(5.0, 9.0), crash=0.45, foam=1.3),
+        _breeze(r[3], r[4], r[5], sr, 0.018, (400.0, 1500.0), 1.0),
+        _wet(_chorus(gulls, 3.0, sr), "hall", 0.12, sr),
+    ]
+
+
+def _amb_jungle(r: list[Gen], sr: int) -> list[Layer]:
+    birds = _songbirds(r, 20, 5, sr, (0.04, 0.13), [0.0, 6000.0, 4000.0], (3.0, 14.0))
+    birds += [
+        _caller(r[26], sfx.parrot(r[26]), sr, 0.07, 6000.0, (6.0, 25.0), (0.5, 2.0), (1.0, 10.0)),
+        _caller(r[27], sfx.koel(r[27]), sr, 0.06, 3500.0, (15.0, 45.0)),
+    ]
+    far = [
+        _caller(r[28], sfx.whoop(r[28]), sr, 0.07, 1800.0, (15.0, 45.0)),
+        _caller(r[29], sfx.hoot(r[29]), sr, 0.06, 1500.0, (20.0, 60.0)),
+    ]
+    insects = [_gated(_katydid(r[30 + i], sr, 0.012), r[34 + i], sr) for i in range(3)]
+    return [
+        _bed(r[0], sr, 0.02, 60.0, 2500.0, 7.0),  # warm humid air
+        _cicada(r[2], r[3], sr, 0.05),
+        _cicada(r[4], r[5], sr, 0.035),
+        lambda s0: np.sum([c(s0) for c in insects], axis=0),
+        _wet(_chorus(birds, 7.0, sr), "hall", 0.28, sr),
+        _wet(_chorus(far, 7.0, sr), "cathedral", 0.5, sr),
+        _drips(r[6], sr, 3, 0.05),
+    ]
+
+
+def _amb_forest(r: list[Gen], sr: int) -> list[Layer]:
+    birds = _songbirds(r, 20, 4, sr, (0.05, 0.14), [0.0, 5500.0], (6.0, 25.0))
+    other = sfx.cuckoo(r[26]) if r[26].random() < 0.5 else sfx.dove(r[26])
+    birds.append(_caller(r[26], other, sr, 0.06, 2500.0, (15.0, 45.0), (1.0, 3.0)))
+    pecker = sfx.woodpecker(r[27])
+    birds.append(_caller(r[27], pecker, sr, 0.1, 4500.0, (20.0, 70.0), (2.0, 6.0), (4.0, 30.0)))
+    return [
+        _breeze(r[0], r[1], r[2], sr, 0.02, (300.0, 1200.0), 1.0, 3.0),
+        _rustle(r[3], r[4], sr, 0.02),
+        _wet(_chorus(birds, 4.0, sr), "hall", 0.22, sr),
+    ]
+
+
+def _amb_thunderstorm(r: list[Gen], sr: int) -> list[Layer]:
+    th = _Thunder(r[6], r[7], sr, (7.0, 22.0), 0.35)
+    return [
+        *_rain(r[0], r[1], r[2], r[3], sr, level=0.11, low=0.7, drops=90.0, plips=8.0),
+        _breeze(r[4], r[5], r[8], sr, 0.05, (200.0, 900.0), 2.0, 3.5),
+        th.rumble,
+        th.crack,
+    ]
+
+
+def _amb_ice(r: list[Gen], sr: int) -> list[Layer]:
+    gust = _Smooth(r[0], 3.0, 0.0, 1.0)
+    slow = _Smooth(r[1], 11.0, 0.5, 1.0)
+    howl = [
+        _Smooth(r[2], 4.0, 280.0, 520.0),
+        _Smooth(r[3], 5.5, 520.0, 950.0),
+        _Smooth(r[4], 3.2, 1400.0, 2600.0),
+    ]
+    wq = ((22.0, 30.0), (12.0, 45.0), (5.0, 70.0))  # (weight, Q) of each howling resonance
+    snow = _norm(_band(_freqs(sr), 3000, 12000, 2.0))[None, :]
+
+    def ice_shape(f: F64, t: F64) -> F64:
+        g = gust.at(t)[:, None] ** 1.5
+        body = _band(f[None, :], 60.0, 14000.0, 2.0) / np.maximum(f[None, :], 60.0) ** 0.4
+        body = body / np.sqrt(1.0 + (f[None, :] / (600.0 + 2500.0 * g)) ** 4)
+        res = np.ones((t.size, f.size))
+        for h, (w, q) in zip(howl, wq, strict=True):
+            res += w * (0.2 + g) * _peak(f[None, :], h.at(t)[:, None], q)
+        wind = (0.25 + 0.75 * g) * slow.at(t)[:, None] * _rownorm(body * res)
+        out: F64 = 0.05 * wind + 0.008 * g * snow
+        return out
+
+    src = _SpectralNoise(r[5], sr, ice_shape)
+    ev = _Events(_BLOCK, int(1.3 * sr))
+    er = r[6]
+
+    def ice_events(_s0: int) -> F64:
+        for pos in _poisson_positions(er, 0.12, sr):
+            x = sfx.lowpass(sfx.ice_creak(er, sr), sr, er.uniform(2000, 6000))
+            ev.add(int(pos), er.uniform(0.04, 0.12) * x, er.uniform(-0.8, 0.8))
+        for pos in _poisson_positions(er, 0.07, sr):
+            x = sfx.lowpass(sfx.ice_crack(er, sr), sr, er.uniform(2500, 9000))
+            ev.add(int(pos), er.uniform(0.06, 0.2) * x, er.uniform(-0.8, 0.8))
+        return ev.take()
+
+    return [lambda _s0: src.block(), _wet(ice_events, "hall", 0.35, sr)]
+
+
+def _amb_waterfall(r: list[Gen], sr: int) -> list[Layer]:
+    f = _freqs(sr)
+    edges = ((30, 200), (200, 900), (900, 3500), (3500, 14000))
+    bands = [_norm(_band(f, lo, hi, 2.0)) ** 2 for lo, hi in edges]
+    weights = (1.0, 0.9, 0.6, 0.35)
+    churn = [_Smooth(r[i], p, 0.55, 1.45) for i, p in enumerate((0.35, 0.6, 1.1, 1.7))]
+    surge = _Smooth(r[4], 7.0, 0.8, 1.0)
+    jr = r[5]
+    mist = _norm(_band(f, 5000, 16000, 2.0))[None, :]
+
+    def shape(_f: F64, t: F64) -> F64:
+        p = np.zeros((t.size, f.size))
+        for b, w, c in zip(bands, weights, churn, strict=True):
+            p += ((w * c.at(t)) ** 2)[:, None] * b[None, :]
+        jitter = 0.8 + 0.4 * jr.random((t.size, 1))  # turbulence
+        roar = surge.at(t)[:, None] * jitter * np.sqrt(p / len(bands))
+        out: F64 = 0.06 * roar + 0.012 * mist
+        return out
+
+    src = _SpectralNoise(r[6], sr, shape)
+    return [
+        lambda _s0: src.block(),
+        _bubbles(r[7], sr, lambda _s0: 120.0, 250.0, 1500.0, (0.005, 0.03)),
+    ]
+
+
+def _amb_hill_station(r: list[Gen], sr: int) -> list[Layer]:
+    birds = _songbirds(r, 20, 4, sr, (0.03, 0.07), [4500.0, 3500.0], (6.0, 25.0))
+    birds.append(_caller(r[26], sfx.cuckoo(r[26]), sr, 0.05, 2500.0, (12.0, 40.0), (1.0, 2.5)))
+    temple = _Singer(
+        r[27],
+        sfx.bell(r[27]),
+        sr,
+        gain=0.06,
+        pan=float(r[27].uniform(-0.7, 0.7)),
+        cutoff=3000.0,
+        bout=(1, 5),
+        gap=(1.5, 3.5),
+        rest=(25.0, 70.0),
+        first=(2.0, 15.0),
+        busy=0.0,  # strikes overlap the previous bell's ring
+    )
+    return [
+        _breeze(r[0], r[1], r[2], sr, 0.03, (400.0, 1800.0), 2.0, 3.0),
+        _wet(_chorus(birds, 3.0, sr), "hall", 0.35, sr),
+        _wet(_chorus([temple], 6.0, sr), "cathedral", 0.6, sr),
+    ]
+
+
+def _amb_village(r: list[Gen], sr: int) -> list[Layer]:
+    near = [
+        _caller(r[10], sfx.rooster(r[10]), sr, 0.16, 0.0, (25.0, 80.0), (3.0, 8.0), (1.0, 10.0)),
+        _caller(r[11], sfx.rooster(r[11]), sr, 0.05, 2000.0, (30.0, 90.0), first=(8.0, 40.0)),
+        _caller(r[12], sfx.koel(r[12]), sr, 0.06, 4000.0, (15.0, 50.0)),
+        _caller(r[13], sfx.crow(r[13]), sr, 0.06, 3500.0, (10.0, 40.0), (1.0, 4.0)),
+        _caller(r[14], sfx.dove(r[14]), sr, 0.05, 0.0, (10.0, 35.0), (1.0, 3.0)),
+    ]
+    near += _songbirds(r, 20, 2, sr, (0.04, 0.08), [0.0, 5000.0], (5.0, 20.0))
+    cows = [
+        _Singer(
+            r[30 + i],
+            sfx.cowbell(r[30 + i]),
+            sr,
+            gain=float(r[30 + i].uniform(0.03, 0.06)),
+            pan=float(r[30 + i].uniform(-0.8, 0.8)),
+            cutoff=5000.0,
+            bout=(1, 3),
+            gap=(1.0, 4.0),
+            rest=(3.0, 15.0),
+            first=(0.0, 6.0),
+        )
+        for i in range(2)
+    ]
+    return [
+        _breeze(r[0], r[1], r[2], sr, 0.02, (300.0, 1300.0), 1.0, 3.0),
+        _wet(_chorus(near + cows, 7.0, sr), "hall", 0.15, sr),
+    ]
+
+
+def _amb_stream(r: list[Gen], sr: int) -> list[Layer]:
+    flow = _Smooth(r[0], 3.0, 0.8, 1.15)
+    br = r[1]
+    base = _norm(_band(_freqs(sr), 250, 6000, 1.5))[None, :]
+
+    def shape(f: F64, t: F64) -> F64:
+        k = t.size
+        fc = np.exp(br.uniform(math.log(450), math.log(3000), size=(k, 4)))
+        gain = br.uniform(0.5, 3.0, size=(k, 4))
+        res = np.zeros((k, f.size))
+        for j in range(4):
+            res += gain[:, j : j + 1] * _peak(f[None, :], fc[:, j : j + 1], 8.0)
+        out: F64 = 0.03 * flow.at(t)[:, None] * _rownorm(base * (1.0 + res))
+        return out
+
+    src = _SpectralNoise(r[2], sr, shape)
+    burst = _Smooth(r[3], 0.5, 0.3, 1.8)
+
+    def rate(s0: int) -> float:
+        return 75.0 * float(burst.at(np.array([s0 / sr]))[0])
+
+    return [
+        lambda _s0: src.block(),
+        _bubbles(r[4], sr, rate, 600.0, 3200.0, (0.006, 0.035)),
+        _bubbles(r[5], sr, lambda _s0: 1.5, 250.0, 600.0, (0.03, 0.08)),  # bigger "gloops"
+    ]
+
+
+_RECIPES: dict[str, Callable[[list[Gen], int], list[Layer]]] = {
+    "ocean": _amb_ocean,
+    "beach": _amb_beach,
+    "jungle": _amb_jungle,
+    "forest": _amb_forest,
+    "thunderstorm": _amb_thunderstorm,
+    "ice": _amb_ice,
+    "waterfall": _amb_waterfall,
+    "hill_station": _amb_hill_station,
+    "village": _amb_village,
+    "stream": _amb_stream,
+}
 
 
 # -- music -------------------------------------------------------------------------------
@@ -541,7 +1309,10 @@ class _Reverb:
         self.tail = np.zeros((self.nfft - _BLOCK, 2))
 
     def process(self, x: F64) -> F64:
-        y = np.fft.irfft(np.fft.rfft(x, n=self.nfft, axis=0) * self.h, n=self.nfft, axis=0)
+        if not x.any():  # silent input (e.g. a resting caller): only the tail rings on
+            y = np.zeros((self.nfft, 2))
+        else:
+            y = np.fft.irfft(np.fft.rfft(x, n=self.nfft, axis=0) * self.h, n=self.nfft, axis=0)
         y[: self.tail.shape[0]] += self.tail
         out = y[:_BLOCK]
         self.tail = y[_BLOCK:].copy()
@@ -780,14 +1551,28 @@ def _render(stream: _Stream, total: int, out: Path, sample_rate: int) -> Path:
 
 # Per-kind output gain, calibrated so the files land at typical bed levels (measured with
 # ebur128, see docs/PROGRESS.md); the project's loudness pass sets the final level anyway.
-_AMB_GAIN_DB = {  # measured -> target LUFS: rain -24, wind/fire -26, river -24, birds -28,
-    "rain": -5.8,  # night -32, room -42 (room tone is meant to be barely audible)
+# Targets (LUFS): rain -24, wind/fire -26, river -24, birds -28, night -32, room -42 (room
+# tone is meant to be barely audible); ocean/thunderstorm/waterfall -24, beach -25,
+# jungle/ice/stream -26, forest/village -27, hill_station -28 (sparse kinds measured as the
+# mean of two seeds x 180 s, since a short stretch may hold no rooster or thunder at all).
+_AMB_GAIN_DB = {
+    "rain": -5.8,
     "wind": -3.9,
     "fire": -0.8,
     "river": -4.1,
-    "birds": -7.6,
-    "night": 1.8,
+    "birds": -4.2,
+    "night": 2.4,
     "room": -6.4,
+    "ocean": 3.4,
+    "beach": 4.0,
+    "jungle": 0.3,
+    "forest": 1.8,
+    "thunderstorm": -11.0,
+    "ice": 4.4,
+    "waterfall": -1.7,
+    "hill_station": 4.8,
+    "village": 6.7,
+    "stream": -0.5,
 }
 
 

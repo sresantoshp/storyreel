@@ -1,5 +1,64 @@
 # Progress
 
+## 2026-11-17 — Phase 4 sound: environments
+
+Ten new procedural ambiences, all made in code (numpy; no samples, no downloads), through
+the same `make_ambience` / `storyreel ambience` as before: `ocean`, `beach`, `jungle`,
+`forest`, `thunderstorm`, `ice`, `waterfall`, `hill_station`, `village`, `stream`.
+
+### How they are built
+- **Long noise events** (`_Swells`): ocean waves (each 5-12 s: a dark swell that brightens,
+  a crash, then fizzing foam that slides back), thunder rolls (several decaying rumbles;
+  distant = slow and low, close = sharp crack then a bright heavy roll) and cicada choruses
+  that swell up and die away. Size, length, timing and left/right position are random for
+  every event, and events overlap.
+- **Animals and objects** (new `audio/sfx.py`): seven songbird types (tweet, trill, whistle,
+  warble with its own remembered phrase, chip, sweep, chatter), seagull "kee-ow" + laugh,
+  rooster, crow, dove, cuckoo, Asian koel, owl, tropical whoops, parrot, woodpecker drum,
+  temple bell (inharmonic partials, slow beating), cow bell clinks, water drips, thunder
+  crack, ice crack ("pew" + boom) and ice creak. Each animal sits at a fixed place, sings
+  bouts then rests, and every call is re-synthesised with small changes. Distant ones are
+  low-passed and sent through the procedural reverb (valley echo for bells and far calls).
+- `birds` now uses five resident songbirds of different species with a light forest echo;
+  `night` gained an occasional distant owl and crickets that stop and start.
+
+### Measured (seed 1; loudness = ffmpeg ebur128)
+| kind | LUFS (20 s file) | true peak | speed (x realtime, 20 s) |
+|---|---|---|---|
+| ocean | -23.5 | -4.1 dBTP | 14x |
+| beach | -23.1 | -8.8 | 9x |
+| jungle | -26.4 | -15.7 | 4-10x |
+| forest | -25.3 | -14.7 | 9x |
+| thunderstorm | -23.7 | -7.8 | 12x |
+| ice | -27.7 | -14.0 | 28x |
+| waterfall | -24.2 | -12.9 | 16x |
+| hill_station | -27.8 | -13.8 | 6x |
+| village | -28.4 | -15.0 | 9x |
+| stream | -26.2 | -15.1 | 22x |
+
+Gains were calibrated on two seeds x 180 s (sparse sounds such as roosters and thunder need
+a long stretch) to targets between -24 and -28 LUFS. Short files vary by a few dB because a
+5-20 s stretch may or may not contain a crash, a thunder roll or a rooster.
+Memory stays flat: a 10-minute jungle (the heaviest) peaked at 86 MB working set, the same
+as a 20 s one (84 MB); 10-minute thunderstorm 49 MB. Speed varies with machine load: the
+10-minute jungle ran at 5.4x realtime, thunderstorm at 15x.
+
+Listening files (20 s each): `examples/out/ambience/<kind>.wav` (not in git).
+
+### Tests
+273 pass. New: every environment renders cleanly (exact length, no NaN, peak < -1 dBFS,
+loudness inside its window, true peak <= -1 dBTP), no click at block boundaries or at the
+loop seam, deterministic per seed, a 30 s ocean does not repeat itself, 120 s thunderstorm
+memory equals 8 s memory, and every synthesised call starts and ends at silence.
+
+### Honest limits
+These are stylised synthetic sounds checked by numbers, not by listening here. Weakest
+likely: the rooster and crow (buzzy synthesis, recognisable but not natural), the parrot,
+and the ice wind's howl (resonant tones can sound "synth"). Strongest likely: stream,
+waterfall, rain/thunderstorm and ocean, which are shaped noise.
+Story kits still use the old kinds (e.g. `storm` -> rain); switching them to the new ones
+is a one-line change per kit.
+
 ## 2026-11-17 — Phase 4a: voice and procedural sound
 
 Design: ARCHITECTURE.md §3b.
