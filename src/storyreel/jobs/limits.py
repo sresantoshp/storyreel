@@ -159,6 +159,12 @@ def spawn(
     argv: Sequence[str], *, limit_bytes: int | None, **popen_kwargs: Any
 ) -> tuple[subprocess.Popen[bytes], Limiter]:
     """Start a child with a hard memory cap where the OS supports one."""
+    capped = sys.platform == "win32" and limit_bytes is not None
+    if capped:
+        # Start suspended, join the job, then resume: a child that finishes instantly
+        # cannot exit before it is capped (assigning an exited process fails with
+        # ERROR_ACCESS_DENIED, measured on a loaded machine with a fast ffmpeg run).
+        popen_kwargs["creationflags"] = popen_kwargs.get("creationflags", 0) | _CREATE_SUSPENDED
     p: subprocess.Popen[bytes] = subprocess.Popen(
         list(argv), preexec_fn=_preexec(limit_bytes), **popen_kwargs
     )
@@ -170,4 +176,30 @@ def spawn(
             p.kill()
             p.wait()
             raise
+        finally:
+            _resume(p.pid)
     return p, limiter
+
+
+_CREATE_SUSPENDED = 0x00000004
+_PROCESS_SUSPEND_RESUME = 0x0800
+
+
+def _resume(pid: int) -> None:
+    """Resume every thread of a process started with CREATE_SUSPENDED (Windows only)."""
+    import ctypes
+
+    win_dll = getattr(ctypes, "WinDLL")  # noqa: B009 (absent on POSIX type stubs)
+    k32 = win_dll("kernel32", use_last_error=True)
+    ntdll = win_dll("ntdll")
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(_PROCESS_SUSPEND_RESUME, False, pid)
+    if not h:
+        raise OSError(getattr(ctypes, "get_last_error")(), "OpenProcess (resume) failed")  # noqa: B009
+    try:
+        ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+        status = ntdll.NtResumeProcess(ctypes.c_void_p(h))
+        if status != 0:
+            raise OSError(status, "NtResumeProcess failed")
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))

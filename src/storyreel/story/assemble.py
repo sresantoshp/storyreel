@@ -345,7 +345,7 @@ def assemble(
             amb = ambience(kit.ambience, r1 - r0 + 1.0, media / f"amb_{r:03d}_{kit.ambience}.wav")
             aid = _import_generated(p, ffmpeg, ffprobe, amb, "procedural (CC0)")
             alen = min(c1 - c0, _snap_down(rate, _asset_len(p, aid)))
-            cid = ed.add_clip(amb_t, c0, alen, asset_id=aid, gain_db=-14.0)
+            cid = ed.add_clip(amb_t, c0, alen, asset_id=aid, gain_db=-10.0)
             ed.set_props(cid, fade_in=min(1.0, (r1 - r0) / 3), fade_out=min(1.0, (r1 - r0) / 3))
 
         # 2b. characters: one clip per species per stretch of consecutive scenes it is in
@@ -361,7 +361,7 @@ def assemble(
         mfile = music(mood, total + 1.0, media / f"music_{mood}.wav")
         aid = _import_generated(p, ffmpeg, ffprobe, mfile, "procedural (CC0)")
         mlen = min(_snap(rate, total), _snap_down(rate, _asset_len(p, aid)))
-        mid = ed.add_clip(mus_t, 0, mlen, asset_id=aid, gain_db=-8.0)
+        mid = ed.add_clip(mus_t, 0, mlen, asset_id=aid, gain_db=-11.0)
         ed.set_props(mid, fade_in=1.5, fade_out=2.5)
 
         # 4. title and on-screen captions
