@@ -54,7 +54,7 @@ def _filt(x: F64, sr: int, gain: Callable[[F64], F64]) -> F64:
     if x.size < 8:
         return np.zeros(x.size)
     n = 1 << int(math.ceil(math.log2(x.size + 4096)))
-    f = np.fft.rfftfreq(n, 1.0 / sr)
+    f = np.asarray(np.fft.rfftfreq(n, 1.0 / sr), np.float64)
     y = np.fft.irfft(np.fft.rfft(x, n) * gain(f), n)[: x.size]
     out: F64 = y * env_ar(x.size, sr, 0.002, 0.002)
     return out

@@ -184,7 +184,7 @@ class _SpectralNoise:
 
     def __init__(self, rng: Gen, sr: int, shape: Callable[[F64, F64], F64]) -> None:
         self.rng, self.sr, self.shape = rng, sr, shape
-        self.freqs: F64 = np.fft.rfftfreq(_N, 1.0 / sr)
+        self.freqs: F64 = np.asarray(np.fft.rfftfreq(_N, 1.0 / sr), np.float64)
         self.win = np.sin(np.pi * (np.arange(_N) + 0.5) / _N)[None, :, None]
         self.carry = np.zeros((_HOP, 2))
         self.frame = 0
@@ -409,7 +409,7 @@ def _ambience_layers(kind: str, sr: int, seed: int) -> list[Layer]:
 
 
 def _freqs(sr: int) -> F64:
-    out: F64 = np.fft.rfftfreq(_N, 1.0 / sr)
+    out: F64 = np.asarray(np.fft.rfftfreq(_N, 1.0 / sr), np.float64)
     return out
 
 
