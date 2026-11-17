@@ -1,5 +1,99 @@
 # Progress
 
+## 2026-11-17 — Phase 4a: voice and procedural sound
+
+Design: ARCHITECTURE.md §3b.
+
+### Works
+- **Offline TTS** (`storyreel.voice`): Kokoro-82M through `kokoro-onnx`, English (28 voices)
+  and Hindi (`hf_alpha`, `hf_beta`, `hm_omega`, `hm_psi`). API: `available`, `voices`,
+  `ensure_models`, `synthesize` -> `SpeechResult(path, duration_s, sample_rate, words)`.
+  Inference runs only in a child process under a Job Object cap (1.5 GB), with heartbeat and
+  timeout; text is spoken sentence by sentence and streamed into the WAV. Typed errors:
+  `ModelMissingError` (fix = download command), `ModelDownloadError` (offline / bad hash),
+  `SynthesisMemoryError`, `SynthesisTimeoutError`, `SynthesisError`, `VoiceError` (bad input).
+- **Hindi works**: espeak-ng turns Devanagari into Hindi IPA (e.g. "एक समय की बात है" ->
+  `ˈeːk sˈʌmˌɛj ki bˈaːt hɛː`) and the Hindi voices speak it; word timings matched the
+  text one-to-one on every Hindi test sentence. Intelligibility was not judged by ear
+  (no listening possible here); objective checks only: non-silent, energy inside word spans.
+- **Word timestamps** from the model's phoneme durations, matched to words, then anchored
+  to the measured speech onset/offset of each sentence (raw durations drift 0.1-0.25 s).
+  Sentences where the words do not match one-to-one fall back to a length-proportional
+  estimate. 40/40 sentences of the 131 s test narration had model timings.
+- **Procedural sound** (`audio/procedural.py`): ambiences rain, wind, fire, river, birds,
+  night, room; music moods calm, happy, sad, tense, mysterious, epic (chord progression,
+  pads, bass, arpeggio, drum for epic, procedural reverb). Deterministic per seed, 24-bit
+  stereo WAV, any length at constant memory, loop-crossfaded head/tail, peak < -1 dBFS.
+- **Integration**: `media/generated.py` writes into `<project>/assets/generated/`, imports
+  with `is_generated=1`, licence and a generator `source_url`, and places the clip on a free
+  track of the right bus (speech -> dialogue, music -> music, ambience -> ambience). Music
+  and ambience duck under speech through the Phase 3 buses.
+- **CLI**: `voices --lang en|hi`, `models download|list --lang`, `say PROJECT "text" --lang
+  hi [--voice] [--speed] [--at]`, `ambience PROJECT rain --at --dur [--seed] [--gain-db]`,
+  `music PROJECT calm --at --dur ...`. `doctor` reports `TTS model (en|hi)` as OK, or INFO
+  with the download command.
+- 180 tests (123 + 57): procedural length/clipping/seam/spectrum/loudness/determinism/memory,
+  sentence splitting (incl. danda), word alignment, SHA-256 verification + offline error with
+  a fake model, missing-model errors, doctor, real English + Hindi synthesis, memory-cap error,
+  CLI end to end with a rendered mix at -14 LUFS. TTS tests skip cleanly without the model
+  (checked with an empty model dir: 8 pass, 4 skip). ruff, ruff format, mypy --strict clean.
+
+### Measured (same laptop; another session's LLM + IDE running: 22-55 % CPU busy, 0.7-1.0 GB free)
+
+| Test | Result |
+|---|---|
+| TTS English, 5 sentences, 16.0 s audio | 24.0 s wall incl. 2.3 s model load = **0.67x real time** (0.74x without load) |
+| TTS Hindi, 4 sentences, 16.1 s audio | 23.6 s wall incl. 2.5 s load = **0.68x real time** (0.76x without load) |
+| TTS English, 40 sentences, 130.8 s audio | 170.9 s wall = **0.77x real time** |
+| TTS worker memory (all three runs) | **peak working set 0.47-0.49 GB**, Job Object commit peak 0.68-0.70 GB; does not grow with length |
+| TTS worst seen under heavy load | Hindi 3.4 s in 21.1 s (0.16x) during a busy period; speed depends on free CPU |
+| Kokoro variants, same sentence, warm | fp32 ~1.0x / fp16 ~0.85x / int8 0.15-0.22x real time; RSS ~0.48 / 0.59 / 0.40 GB (fp32 with arena off) |
+| Memory cap 150 MB | `SynthesisMemoryError`, caller unaffected, no partial file left |
+| 60 s ambience, each kind | **2.0-5.2 s** (12-30x real time); night (4 cricket layers) is slowest |
+| 60 s music, each mood | **15-24 s** typical (2.5-4x real time); one run at 195 s while the machine was saturated |
+| 10 min rain vs 30 s rain | peak working set **45 MB both**; 16.3 s for 10 min |
+| 10 min calm music vs 30 s | peak working set **61 MB both**; 103 s for 10 min |
+| Levels (60 s, ebur128) | rain -23.6, wind -26.8, fire -25.9, river -23.8, birds -28.7, night -32.1, room -41.9 LUFS; music -17.6..-18.3 LUFS; true peak <= -5.8 dBTP everywhere |
+| Spectra (60 s) | rain 60 % of energy above 4 kHz; wind 89 % below 1 kHz; birds 82 % in 4-8 kHz; night 52 % in 4-8 kHz (crickets) |
+
+### Downloaded files (kept in `%LOCALAPPDATA%\StoryReel\models\kokoro-v1.0\`)
+
+| File | Size | SHA-256 | Verified against | Licence |
+|---|---|---|---|---|
+| `kokoro-v1.0.onnx` | 325,505,369 B | `beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a` | GitHub release asset digest (thewh1teagle/kokoro-onnx `model-files-v1.1`): match | Kokoro-82M weights Apache-2.0 (HF `hexgrad/Kokoro-82M` cardData.license); ONNX export repo MIT |
+| `voices-v1.0.bin` | 28,214,398 B | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` | same release, digest match | Apache-2.0 (voices are part of Kokoro-82M) |
+
+Evaluated and deleted (not used): `kokoro-v1.0.int8.onnx` (114,119,327 B, `ae315a79…ee9c`,
+digest match; 5x slower) and `kokoro-v1.0.fp16.onnx` (163,527,961 B, `f3a290d3…ac96`, digest
+match; slower than fp32, same RAM).
+
+New Python dependencies (one: `kokoro-onnx`, needed to run Kokoro; the rest are its
+dependencies): kokoro-onnx 0.6.1 (MIT), onnxruntime 1.32.0 (MIT), phonemizer 3.6.0
+(**GPL-3.0**), espeakng-loader 0.2.4 (MIT, bundles **espeak-ng, GPL-3.0**), attrs (MIT),
+dlinfo (MIT), joblib (BSD-3), cloudpickle (BSD-3), flatbuffers (Apache-2.0), protobuf
+(BSD-3). All free and open source. The GPL parts cover redistributing StoryReel's binaries
+(source must be offered); they place no restriction on the audio produced, so monetised
+videos are fine.
+
+### Honest limits
+- **TTS is slower than real time** on this laptop (0.7-0.8x when the CPU is shared, ~1x
+  when idle): a 60 s narration takes ~1.3 min, an 8 min one ~10 min. Model load adds 2-5 s
+  per `synthesize` call (one worker per call); batching many lines into one call is cheaper.
+- Hindi quality is Kokoro's (its Hindi voices are rated lower than its English ones in
+  VOICES.md) and espeak-ng's Hindi phonemiser: no schwa-deletion tuning, English words in
+  Latin script inside Hindi text are read by espeak's rules. Not judged by a listener.
+- Word times are approximate (syllable-level), not forced alignment.
+- Procedural music is simple ambient pad music (4-chord loops per mood, one seeded variation:
+  the start chord); it will sound repetitive over minutes. The loop crossfade can land in the
+  middle of a chord. No listening test was possible; checks are objective only.
+- Ambiences are synthetic approximations; birds/crickets are stylised.
+- `available()` checks file size + mtime against the verified marker, not a full re-hash.
+- Measured on Windows only, with CPU shared with another session; numbers vary run to run.
+
+### Next
+Story planner (other session) calls `voice.synthesize` and `audio.procedural`; captions from
+`SpeechResult.words`; optional Piper voices if more Indic languages are needed.
+
 ## 2026-11-16 — Phase 3: audio engine
 
 Design and the parts that differ from the first draft: ARCHITECTURE.md §3a.

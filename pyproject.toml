@@ -12,6 +12,7 @@ dependencies = [
     "uharfbuzz>=0.40",
     "freetype-py>=2.5",
     "huggingface-hub>=0.34",
+    "kokoro-onnx>=0.6.1",
 ]
 
 [project.scripts]
@@ -67,6 +68,10 @@ files = ["src/storyreel"]
 
 [[tool.mypy.overrides]]
 module = ["uharfbuzz", "freetype", "freetype.*"]  # C extensions without type stubs
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["onnxruntime", "onnxruntime.*"]  # no type stubs; used only in the TTS worker
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

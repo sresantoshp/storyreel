@@ -270,6 +270,34 @@ def _check_memory_limits() -> Check:
     return Check(name, Status.WARN, "macOS: no reliable per-process RAM limit; watchdog only")
 
 
+def _check_tts() -> list[Check]:
+    """Offline speech models: INFO when absent (speech is optional), with the fix."""
+    from storyreel.voice import models, tts
+
+    out = []
+    for lang in models.LANGS:
+        spec = models.spec_for(lang)
+        name = f"TTS model ({lang})"
+        try:
+            ok = tts.available(lang)
+        except Exception as exc:  # noqa: BLE001 (doctor reports, never crashes)
+            out.append(Check(name, Status.WARN, f"check failed: {exc}", "Re-download the model."))
+            continue
+        if ok:
+            out.append(Check(name, Status.OK, f"{spec.id} in {models.model_dir(spec)}"))
+        else:
+            cmd = models.download_command(lang)
+            out.append(
+                Check(
+                    name,
+                    Status.INFO,
+                    f"{spec.id} not installed (speech disabled); run `{cmd}` once",
+                    cmd,
+                )
+            )
+    return out
+
+
 def _check_keys(env: Mapping[str, str]) -> list[Check]:
     return [
         Check(
@@ -294,6 +322,7 @@ def run_checks(
         lambda: _check_sqlite(data_dir),
         lambda: _check_ffmpeg(test_hw),
         _check_memory_limits,
+        _check_tts,
         lambda: _check_keys(env),
     ]
     checks: list[Check] = []

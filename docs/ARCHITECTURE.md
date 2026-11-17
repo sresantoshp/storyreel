@@ -1,6 +1,6 @@
 # StoryReel Architecture
 
-Status: Phases 1-3 implemented (2026-11-16). Sections marked "as built" or
+Status: Phases 1-3 implemented (2026-11-16); Phase 4a (voice + procedural sound) 2026-11-17. Sections marked "as built" or
 "implemented" describe the code; the rest is still the plan.
 Numbers marked **measured** were taken on the dev machine (Windows 11, Intel UHD iGPU,
 Python 3.13). Numbers marked **estimate** must be replaced by measurements in the phase
@@ -18,10 +18,10 @@ replaces the original "backend A = cloud APIs, default for realism".
 | Need | Default (all local) | Excluded, and why |
 |---|---|---|
 | Story/script | llama.cpp + open-weight ~3B model (e.g. Qwen2.5-3B-Instruct, Apache-2.0); rule-based splitter fallback | Cloud LLM APIs (paid) |
-| Voice | Kokoro-82M (Apache-2.0), Piper (MIT); voice licences checked per voice | Cloud TTS (paid); non-commercial voices |
+| Voice | **As built:** Kokoro-82M (weights + voices Apache-2.0) as fp32 ONNX via `kokoro-onnx` (MIT), English + Hindi; phonemes by espeak-ng (GPL-3.0, bundled by `espeakng-loader`) through `phonemizer` (GPL-3.0). Piper (MIT) not needed so far | Cloud TTS (paid); non-commercial voices; Kokoro int8 ONNX (works, but measured 5x slower on this CPU) |
 | Images | SD 1.5 + LCM via OpenVINO on CPU / Intel iGPU (OpenRAIL-M allows commercial use) | SD-Turbo / SDXL-Turbo (non-commercial licence) |
 | Video realism | Stills animated (Ken Burns, parallax, depth 2.5D, environments); free stock downloaded when online, cached | Local video diffusion (needs 8-24 GB VRAM); cloud video gen (paid) |
-| Music / SFX | Procedural generators; user's CC0 / YouTube Audio Library files | MusicGen (CC-BY-NC weights) |
+| Music / SFX | **As built:** procedural numpy generators (`audio/procedural.py`, CC0, deterministic); user's CC0 / YouTube Audio Library files | MusicGen (CC-BY-NC weights) |
 | Captions / translation | faster-whisper (MIT), Argos Translate (MIT) | NLLB (CC-BY-NC) |
 | Fonts | Noto (OFL), bundled | Relying on OS fonts only |
 | Atmos | Not offered (needs a paid Dolby licence); the exporter hook stays | — |
@@ -72,7 +72,7 @@ offline, and real footage from free stock libraries.
         ▼                                       ▼
  ┌─────────────────────────────┐   ┌──────────────────────────────────────┐
  │ Render worker (1 chunk/job) │   │ Other workers: proxy, waveform,      │
- │  ffmpeg decode ×L ──pipe──┐ │   │ thumbnails, TTS (Piper), ASR         │
+ │  ffmpeg decode ×L ──pipe──┐ │   │ thumbnails, TTS (Kokoro), ASR        │
  │  numpy compositor ◄───────┘ │   │ (faster-whisper), cloud gen clients  │
  │  ffmpeg encode ◄──pipe──    │   └──────────────────────────────────────┘
  └──────────┬──────────────────┘
@@ -288,6 +288,52 @@ the master, no limiter, sample-aligned to the video (start 0, same length). They
 bus-fx/ducking and pre master-fx: they sum to the master exactly when the master chain is
 empty and the limiter did not engage.
 
+## 3b. Voice and procedural sound (Phase 4a, implemented)
+
+**TTS** (`storyreel.voice`): `synthesize(text, out, lang="en"|"hi", voice, speed)` splits the
+text into sentences (`. ! ?` and the Devanagari danda `।`; over-long sentences at clauses,
+<= 300 chars), starts `python -m storyreel.voice.worker` through `jobs.limits.spawn` (Job
+Object cap 1.5 GB, heartbeat 240 s, overall timeout 120 s + 0.5 s/char) and sends the job as
+JSON on stdin. The worker loads Kokoro once (onnxruntime CPU, memory arena off), speaks one
+sentence at a time and appends 16-bit 24 kHz mono PCM to a `.part.wav`, printing one JSON line
+per sentence (heartbeat + word times). Memory therefore does not grow with text length
+(measured: 16 s and 131 s narrations both peak at ~0.48 GB working set, ~0.7 GB commit).
+The parent renames the file only after a `done` event; failures map to typed errors
+(`ModelMissingError`, `SynthesisMemoryError`, `SynthesisTimeoutError`, `SynthesisError`).
+
+Word timestamps: kokoro-onnx 0.6 exposes per-phoneme durations. Phoneme groups between
+spaces are matched one-to-one to the sentence's words; if the counts differ (numbers,
+abbreviations) the words are spread over the voiced span by length (estimated). Either way
+the sentence's times are mapped linearly onto the speech onset/offset measured from the audio
+(the raw durations drift ~0.1-0.25 s). Good enough for subtitle and cut timing, not
+sample-exact.
+
+Models: `storyreel models download --lang en|hi` fetches `kokoro-v1.0.onnx` + `voices-v1.0.bin`
+(354 MB) once into `<data dir>/models/kokoro-v1.0/`, verifies each against the SHA-256 digest
+GitHub publishes for the release asset, and writes `verified.json` (licence, URLs, hashes,
+size + mtime). `available()` trusts size + mtime afterwards (no 0.5 s re-hash per call) and
+never loads the model in the caller.
+
+**Procedural sound** (`audio/procedural.py`): numpy only, ~1 s stereo blocks straight into a
+24-bit WAV (constant memory: 45 MB for 30 s or 10 min of rain; 61 MB for music). Spectral
+noise (random spectra shaped per 21 ms frame, sqrt-Hann overlap-add) for hiss/wind/river/room
+tone; Poisson-placed synthesised events in a carry buffer (rain drops, fire crackles and pops,
+Minnaert water bubbles, three bird-call species); cricket pulse trains. Music: per-mood chord
+progression, tempo, additive detuned pads (harmonic roll-off = soft low-pass), bass style,
+plucked arpeggio, low drum for "epic", procedural hall/cathedral reverb (`audio/ir.py`) by FFT
+overlap-add. Each layer has its own seeded generator (`SeedSequence.spawn`), so output is
+byte-identical per seed. Loop: the stream runs `xfade` (2 s) longer and its tail is
+equal-power crossfaded into the head. A soft knee above -6 dBFS keeps every sample under
+-1.2 dBFS. Levels are calibrated with ebur128 (beds -24..-42 LUFS, music about -18 LUFS);
+the project loudness pass sets the final mix level.
+
+**Integration**: generated files go to `<project>/assets/generated/` (name = hash of the
+parameters, so repeating a command reuses the file), are imported with `is_generated = 1`,
+`license` (TTS model licence + voice, or "procedural ..., CC0") and a `source_url` describing
+generator + parameters, then placed on the first free audio track routed to the right bus
+(speech -> dialogue, ambience -> ambience, music -> music; a new track is added when every
+track of that bus is busy). Ducking under speech is the Phase 3 mechanism, unchanged.
+
 ## 4. Cache keys and invalidation
 
 Key = `blake2b(canonical_json(inputs), digest_size=20)` where inputs are:
@@ -406,8 +452,8 @@ text ─► StoryEngine (LLM provider, strict pydantic schema, repair + retry �
      ─► Outline ─► Scenes ─► Shots (duration, camera, visual, narration, text, sfx, music, mood, transition)
      ─► Bible (characters, locations, style) ─► per-shot prompt builder
      ─► Estimator (cost $, time s per backend) ─► user confirms if cost > 0
-     ─► Jobs: visuals (A cloud → B local → C stock/procedural), TTS (cloud → Piper),
-              music/SFX/ambience (cloud → library → procedural)
+     ─► Jobs: visuals (B local → C stock/procedural), TTS (Kokoro, offline),
+              music/SFX/ambience (user library → procedural)
      ─► Auto-assembly: narration word timestamps drive shot cuts and subtitles
      ─► Timeline in project.db; every shot linked back to its spec (stale tracking)
 ```
@@ -419,7 +465,9 @@ Honest limits on the target laptop (8 GB, 4 cores, no discrete GPU):
 - Offline story writing: no LLM offline by default. Offline mode uses a deterministic
   splitter (sentences → shots, keyword → stock/procedural visuals). Lower quality, always
   works. A local small LLM (llama.cpp, ~3B Q4, ~2.5 GB RAM) is an optional backend B.
-- Piper TTS on CPU: faster than real time on 4 cores (**estimate**, measure Phase 4).
+- Kokoro TTS on CPU (**measured**, Phase 4a): 0.7-0.8x real time (audio s per wall s) on this
+  i3 with other work running, i.e. a 60 s narration takes ~80 s. Slower than the old Piper
+  estimate; acceptable for batch narration, not for live preview.
 - Acceptance test "60 s video from text in < 10 min via backend C + Piper": feasible;
   stock search needs internet unless the user's local media library is used.
 
