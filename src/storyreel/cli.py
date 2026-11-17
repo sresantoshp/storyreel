@@ -12,7 +12,17 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from storyreel import __version__, cli_audio, cli_edit, cli_project, cli_voice, doctor, logs, paths
+from storyreel import (
+    __version__,
+    cli_audio,
+    cli_edit,
+    cli_project,
+    cli_story,
+    cli_voice,
+    doctor,
+    logs,
+    paths,
+)
 from storyreel.errors import ExitCode, StoryReelError
 from storyreel.hw import profile as hwprofile
 from storyreel.hw.sysinfo import GB, MB
@@ -110,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_edit.register(sub)
     cli_audio.register(sub)
     cli_voice.register(sub)
+    cli_story.register(sub)
     return ap
 
 

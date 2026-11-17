@@ -20,10 +20,12 @@ from dataclasses import dataclass
 
 from storyreel.errors import StoryReelError
 from storyreel.story import kits as kitmod
-from storyreel.story import llm
+from storyreel.story import llm, translate
 from storyreel.story.lang import LANG_NAMES, resolve_language
 from storyreel.story.schema import (
     MAX_SCENES_PER_CALL,
+    SCENE_SECONDS,
+    WORDS_PER_SECOND,
     PlanError,
     Scene,
     StoryPlan,
@@ -86,8 +88,10 @@ def _system_prompt(lang: str) -> str:
         "You are a scriptwriter for short narrated story videos on YouTube. "
         f"Write ALL narration, the title and on-screen text in {name}"
         + (" using Devanagari script" if lang == "hi" else "")
-        + ". Each scene's narration is one to three vivid spoken sentences that continue the "
-        "story; scenes must connect into one story with a beginning, middle and end. "
+        + f". Each scene's narration is two or three vivid spoken sentences, about "
+        f"{round(SCENE_SECONDS * WORDS_PER_SECOND.get('en', 2.5))} words, so it takes about "
+        f"{SCENE_SECONDS:.0f} seconds to say. The scenes together must tell the WHOLE idea as one "
+        "story with a beginning, a middle and an ending; the last scene must finish the story. "
         "For each scene choose the visual kit that best fits it from this list:\n"
         + kitmod.describe_for_writer()
         + "\nChoose a mood per scene. onscreen is an optional short caption (or empty)."
@@ -101,6 +105,33 @@ def _tokens_for(n_scenes: int, lang: str) -> int:
 
 
 def _llm_plan(req: PlanRequest, lang: str, progress: Progress) -> StoryPlan:
+    """Write with the local LLM. Languages the writers handle badly (measured: Hindi) are
+    written in English and translated with IndicTrans2, the owner's chosen route."""
+    if lang != "en" and lang in translate.TARGETS:
+        if not translate.available():
+            raise llm.LLMUnavailableError(
+                f"Writing in {LANG_NAMES[lang]} needs the IndicTrans2 translator: "
+                f"{translate.why_unavailable()}.",
+                fix="Finish the translator setup (docs/PROGRESS.md), or pass --mode script "
+                "with your own text.",
+            )
+        english = _llm_plan(
+            PlanRequest(req.text, req.length_s, "en", "llm", req.writer), "en", progress
+        )
+        progress(f"translating {len(english.scenes)} scenes into {LANG_NAMES[lang]} (IndicTrans2)")
+        tr = translate.shared()
+        texts = [english.title] + [s.narration for s in english.scenes]
+        caps = [s.onscreen for s in english.scenes]
+        done = tr.translate(texts, lang)
+        done_caps = tr.translate([c for c in caps if c], lang) if any(caps) else []
+        it = iter(done_caps)
+        translated = [
+            Scene(n, s.kit, s.mood, next(it) if s.onscreen else "")
+            for n, s in zip(done[1:], english.scenes, strict=True)
+        ]
+        return StoryPlan(
+            done[0], lang, translated, english.source + "+indictrans2", english.warnings
+        )
     key = llm.pick_model(lang, req.writer)
     info = llm.MODELS[key]
     n = scene_count(req.length_s)

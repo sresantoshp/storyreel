@@ -54,8 +54,13 @@ class StoryPlan:
         )
 
 
+# Measured: the local 1.5B writer averages ~15 words (~6.5 s spoken) per scene even when
+# asked for ~25, so scenes are counted at 7 s each to land near the requested length.
+EFFECTIVE_SCENE_SECONDS = 7.0
+
+
 def scene_count(length_s: float) -> int:
-    return max(1, min(400, math.ceil(length_s / SCENE_SECONDS)))
+    return max(1, min(500, math.ceil(length_s / EFFECTIVE_SCENE_SECONDS)))
 
 
 def narration_chars(lang: str) -> int:

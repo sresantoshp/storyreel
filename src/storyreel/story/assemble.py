@@ -112,6 +112,7 @@ def assemble(
     height: int = 1080,
     voice_licence: str = "TTS",
     progress: Progress | None = None,
+    captions: bool = False,
 ) -> Assembled:
     say = progress or (lambda m: None)
     w, h = frame_size(aspect, height)
@@ -140,7 +141,7 @@ def assemble(
         # 1. narration, which sets every scene's timing
         starts: list[float] = []
         durs: list[float] = []
-        words: list[tuple[str, float, float]] = []
+        scene_words: list[list[tuple[str, float, float]]] = []
         t = 0.0
         for i, scene in enumerate(plan.scenes, start=1):
             say(f"voice {i}/{len(plan.scenes)}")
@@ -149,7 +150,12 @@ def assemble(
             dur = max(MIN_SCENE_S, LEAD_S + sp.duration_s + TAIL_S)
             clip_len = _snap_down(rate, _asset_len(p, aid))
             ed.add_clip(dia_t, _snap(rate, t + LEAD_S), clip_len, asset_id=aid)
-            words += [(wd, t + LEAD_S + a, t + LEAD_S + b) for wd, a, b in sp.words]
+            timed = [(wd, t + LEAD_S + a, t + LEAD_S + b) for wd, a, b in sp.words]
+            scene_words.append(
+                subtitles.align_words(
+                    scene.narration, timed, t + LEAD_S, t + LEAD_S + sp.duration_s
+                )
+            )
             starts.append(t)
             durs.append(dur)
             t += dur
@@ -216,7 +222,7 @@ def assemble(
             },
         )
         for scene, s0, d in list(zip(plan.scenes, starts, durs, strict=True))[1:]:
-            if scene.onscreen and d > 2.5:
+            if captions and scene.onscreen and d > 2.5:
                 ed.add_clip(
                     title_t,
                     _snap(rate, s0 + 0.2),
@@ -233,9 +239,20 @@ def assemble(
                 )
 
         # 5. subtitles: burned-in text clips + .srt sidecar
-        cues = subtitles.build_cues(words, max_chars=42 if w >= h else 26)
+        # cues are built per scene and never outlive their scene
+        cues: list[subtitles.Cue] = []
+        for sw, s0, d in zip(scene_words, starts, durs, strict=True):
+            scene_cues = subtitles.build_cues(sw, max_chars=42 if w >= h else 26)
+            for i, c in enumerate(scene_cues):
+                # linger 0.25 s for reading, but never into the next cue or the next scene
+                limit = scene_cues[i + 1].start if i + 1 < len(scene_cues) else s0 + d - 0.05
+                end = min(c.end + 0.25, limit)
+                if end > c.start:
+                    cues.append(subtitles.Cue(c.start, end, c.text))
+        prev_end = 0
         for c in cues:
-            c0, c1 = _snap(rate, c.start), _snap(rate, c.end)
+            c0, c1 = max(_snap(rate, c.start), prev_end), _snap(rate, c.end)
+            prev_end = max(prev_end, c1)
             if c1 > c0:
                 ed.add_clip(
                     sub_t,

@@ -173,8 +173,8 @@ def test_trim_to_sentence() -> None:
 
 
 def test_scene_count() -> None:
-    assert schema.scene_count(15) == 2 and schema.scene_count(60) == 6
-    assert schema.scene_count(3600) == 360
+    assert schema.scene_count(15) == 3 and schema.scene_count(45) == 7
+    assert schema.scene_count(3600) == 500
 
 
 def test_plan_json_roundtrip() -> None:
@@ -220,3 +220,28 @@ def test_real_writer_english_story() -> None:
     assert plan.source == "llm:qwen2.5-1.5b"
     assert len(plan.scenes) == schema.scene_count(30)
     assert all(s.kit in kits.KITS and s.narration for s in plan.scenes)
+
+
+def test_align_words_keeps_punctuation_for_sentence_breaks() -> None:
+    narration = "The fox ran. It stopped, then smiled!"
+    timed = [(w.strip(".,!"), i * 0.5, i * 0.5 + 0.4) for i, w in enumerate(narration.split())]
+    words = subtitles.align_words(narration, timed, 0.0, 4.0)
+    assert [w for w, _, _ in words] == narration.split()  # punctuation restored
+    assert words[2][1] == timed[2][1]  # timing kept from the voice
+    cues = subtitles.build_cues(words, max_chars=12)
+    assert cues[0].text.replace("\n", " ").endswith("ran.")  # breaks at the sentence end
+    mismatch = subtitles.align_words("Twelve apples here.", [("12", 1.0, 1.5)], 0.0, 3.0)
+    assert [w for w, _, _ in mismatch] == ["Twelve", "apples", "here."]
+    assert mismatch[0][1] == 1.0 and mismatch[-1][2] == 1.5  # spread over the spoken span
+
+
+def test_no_orphan_words_in_cues() -> None:
+    text = (
+        "A curious little fox emerges from a cozy campsite, his fur bristling with "
+        "excitement. The fox spots a small, frozen river in the valley and darts towards "
+        "it with a joyful abandon."
+    )
+    cues = subtitles.build_cues(subtitles.estimate_words(text, 0, 12), max_chars=42)
+    flat = [c.text.replace("\n", " ") for c in cues]
+    assert min(len(t) for t in flat) >= 20, flat  # no one-word orphan cue
+    assert " ".join(flat).split() == text.split()

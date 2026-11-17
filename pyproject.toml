@@ -71,6 +71,13 @@ module = ["uharfbuzz", "freetype", "freetype.*"]  # C extensions without type st
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# Heavy optional ML libraries (translate extra): treated as external, not analysed.
+module = ["torch", "torch.*", "transformers", "transformers.*", "sacremoses", "sacremoses.*",
+          "indicnlp", "indicnlp.*", "sentencepiece", "sentencepiece.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = ["onnxruntime", "onnxruntime.*"]  # no type stubs; used only in the TTS worker
 ignore_missing_imports = true
 
