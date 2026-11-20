@@ -85,6 +85,7 @@ class Clip:
     page_url: str
     author: str
     licence: str
+    tags: str = ""  # library keywords (or the file name), used to pick matching sound
 
 
 class Provider(Protocol):
@@ -518,8 +519,9 @@ class Library:
         dest = self._file_for(c)
         if not self._download(c, dest):
             return None
+        tags = c.tags or c.key.split(":", 1)[1].replace("/", " ").replace("_", " ")
         return Clip(c.key, dest, c.width, c.height, c.duration_s, c.page_url, c.author,
-                    c.licence)  # fmt: skip
+                    c.licence, tags)  # fmt: skip
 
     def find(
         self,

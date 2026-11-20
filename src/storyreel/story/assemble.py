@@ -292,7 +292,7 @@ def _realistic_picture(
     ffprobe: Path,
     root: Path,
     say: Progress,
-) -> None:
+) -> list[real.Shot]:
     """Footage shots with a slow push-in, the film grade, letterbox bars, fades."""
     foot_t, grade_t, top_t, bot_t, fade_t = tracks[0], *tracks[-4:]
     shots = real.plan_shots(plan.scenes, starts, durs, find)
@@ -336,6 +336,7 @@ def _realistic_picture(
     b = ed.add_clip(fade_t, end - fout, fout, color="#000000")
     ed.add_keyframe(b, "opacity", 0, 0.0)
     ed.add_keyframe(b, "opacity", fout, 1.0)
+    return shots
 
 
 def _shot_match(shots: list[real.Shot], ffmpeg: Path) -> list[dict[str, Any]]:
@@ -350,6 +351,82 @@ def _shot_match(shots: list[real.Shot], ffmpeg: Path) -> list[dict[str, Any]]:
     ok = [s for s in stats if s is not None]
     params = iter(real.shot_match(ok))
     return [next(params) if s is not None else {} for s in stats]
+
+
+def _realistic_bed(
+    ed: Editor,
+    p: store.Project,
+    plan: StoryPlan,
+    shots: list[real.Shot],
+    starts: list[float],
+    durs: list[float],
+    total: float,
+    rate: Rate,
+    tracks: tuple[int, int],
+    ambience: SoundFn,
+    music: SoundFn,
+    media: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    say: Progress,
+) -> None:
+    """Ambience from what each scene shows and music that follows the story's moods,
+    each crossfaded on two alternating tracks; the music builds towards the climax."""
+    amb_a, mus_a = tracks
+    amb_b, mus_b = ed.add_track("audio", "Ambience B"), ed.add_track("audio", "Music B")
+    ed.set_track(amb_b, bus="ambience")
+    ed.set_track(mus_b, bus="music")
+    end = _snap(rate, total)
+
+    def lay(
+        segs: list[tuple[str, float, float]],
+        pair: tuple[int, int],
+        make: SoundFn,
+        prefix: str,
+        gain_db: float,
+        xfade: float,
+        edges: tuple[float, float],
+    ) -> list[int]:
+        ids = []
+        for i, (key, a, b) in enumerate(segs):
+            first, last = i == 0, i == len(segs) - 1
+            c0 = 0 if first else _snap(rate, max(0.0, a - xfade / 2))
+            c1 = end if last else _snap(rate, min(total, b + xfade / 2))
+            f = make(key, (c1 - c0) / FLICKS + 0.5, media / f"{prefix}_{i:03d}_{key}.wav")
+            aid = _import_generated(p, ffmpeg, ffprobe, f, "procedural (CC0)")
+            ln = min(c1 - c0, _snap_down(rate, _asset_len(p, aid)))
+            cid = ed.add_clip(pair[i % 2], c0, ln, asset_id=aid, gain_db=gain_db)
+            half = ln / FLICKS / 2
+            ed.set_props(
+                cid,
+                fade_in=min(half, edges[0] if first else xfade),
+                fade_out=min(half, edges[1] if last else xfade),
+            )
+            ids.append(cid)
+        return ids
+
+    kinds = []
+    for i, scene in enumerate(plan.scenes):
+        tags = [s.clip.tags for s in shots if s.scene == i]
+        kinds.append(real.scene_ambience(KITS[scene.kit].ambience, tags))
+    amb_segs = real.segments(kinds, starts, durs)
+    lay(amb_segs, (amb_a, amb_b), ambience, "amb", real.AMB_GAIN_DB, real.AMB_XFADE_S,
+        (1.0, 1.5))  # fmt: skip
+    moods = real.segments([s.mood for s in plan.scenes], starts, durs, real.MUSIC_MIN_S)
+    music_ids = lay(moods, (mus_a, mus_b), music, "music", real.MUSIC_GAIN_DB,
+                    real.MUSIC_XFADE_S, (1.5, 2.5))  # fmt: skip
+    for cid in music_ids:
+        row = p.con.execute("SELECT start, duration FROM clip WHERE id = ?", (cid,)).fetchone()
+        c0, ln = int(row[0]), int(row[1])
+        for frac in (0.0, 0.5, 1.0):  # level follows the story arc
+            t = c0 + round(frac * ln)
+            ed.add_keyframe(cid, "volume", t - c0, round(real.music_arc_db(t / FLICKS, total), 2))
+    say(
+        "sound bed: ambience "
+        + " → ".join(k for k, _, _ in amb_segs)
+        + "; music "
+        + " → ".join(k for k, _, _ in moods)
+    )
 
 
 def real_fade(seconds: float, total: float) -> float:
@@ -512,6 +589,8 @@ def assemble(
                 if r < len(runs) - 1:
                     ed.add_keyframe(cid, "opacity", c1 - c0 - fade, 1.0)
                     ed.add_keyframe(cid, "opacity", c1 - c0, 0.0)
+            if realistic:  # sound follows the footage instead (_realistic_bed)
+                continue
             # ambience for this segment
             amb = ambience(kit.ambience, r1 - r0 + 1.0, media / f"amb_{r:03d}_{kit.ambience}.wav")
             aid = _import_generated(p, ffmpeg, ffprobe, amb, "procedural (CC0)")
@@ -521,9 +600,13 @@ def assemble(
 
         if realistic:
             assert find_footage is not None and sfx is not None
-            _realistic_picture(
+            shots = _realistic_picture(
                 ed, p, plan, starts, durs, total, rate, vtracks[:n_pic], w, h, k,
                 find_footage, ffmpeg, ffprobe, root, say,
+            )  # fmt: skip
+            _realistic_bed(
+                ed, p, plan, shots, starts, durs, total, rate, (amb_t, mus_t),
+                ambience, music, media, ffmpeg, ffprobe, say,
             )  # fmt: skip
             _realistic_sound(ed, p, starts, total, rate, sfx, media, ffmpeg, ffprobe, say)
         else:
@@ -534,14 +617,15 @@ def assemble(
             if n_actor_clips:
                 say(f"characters: {n_actor_clips} animated clip(s)")
 
-        # 3. music: one bed in the story's dominant mood
-        mood = Counter(s.mood for s in plan.scenes).most_common(1)[0][0]
-        say(f"music: {mood}, {total:.0f} s")
-        mfile = music(mood, total + 1.0, media / f"music_{mood}.wav")
-        aid = _import_generated(p, ffmpeg, ffprobe, mfile, "procedural (CC0)")
-        mlen = min(_snap(rate, total), _snap_down(rate, _asset_len(p, aid)))
-        mid = ed.add_clip(mus_t, 0, mlen, asset_id=aid, gain_db=-11.0)
-        ed.set_props(mid, fade_in=1.5, fade_out=2.5)
+        # 3. music: one bed in the story's dominant mood (realistic: _realistic_bed)
+        if not realistic:
+            mood = Counter(s.mood for s in plan.scenes).most_common(1)[0][0]
+            say(f"music: {mood}, {total:.0f} s")
+            mfile = music(mood, total + 1.0, media / f"music_{mood}.wav")
+            aid = _import_generated(p, ffmpeg, ffprobe, mfile, "procedural (CC0)")
+            mlen = min(_snap(rate, total), _snap_down(rate, _asset_len(p, aid)))
+            mid = ed.add_clip(mus_t, 0, mlen, asset_id=aid, gain_db=-11.0)
+            ed.set_props(mid, fade_in=1.5, fade_out=2.5)
 
         # 4. title and on-screen captions
         ed.add_clip(

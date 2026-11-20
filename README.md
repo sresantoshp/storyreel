@@ -56,7 +56,8 @@ Footage is chosen by CLIP (a small open model, 146 MB, downloaded once): every c
 preview is scored against the narration, so "playful monkeys" gets monkeys playing, not a
 monkey portrait. Drawn/CGI clips are never used. `--no-match` skips this (faster).
 
-Sound in the realistic style: a broadcast voice chain (EQ, compression, de-esser), a braam under the title, whooshes on cuts, a riser into the final
+Sound in the realistic style: nature sound chosen from what each clip shows, music that changes
+with the story's moods and builds to the climax (both crossfaded), a broadcast voice chain (EQ, compression, de-esser), a braam under the title, whooshes on cuts, a riser into the final
 scene and an impact on it, hall reverb on effects, master glue compression, −14 LUFS.
 
 Demo: `python examples/phase2_demo.py` (18 s animated scene, CLI only, offline).

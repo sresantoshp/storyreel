@@ -1,5 +1,26 @@
 # Progress
 
+## 2026-11-20 — Realistic step 2: sound that follows the picture and the story
+
+### Works
+- **Ambience from the footage:** each scene's nature sound comes from the tags of the clips
+  on screen (waves → ocean, campfire → fire, beach → surf, monkey → jungle …), most votes
+  wins and the establishing shot breaks ties; the kit's ambience only when no tag says
+  anything. Consecutive same-sound scenes are one clip; changes crossfade 1.5 s on two
+  alternating tracks.
+- **Music by mood:** stretches of scenes with one mood (at least 8 s; shorter ones join
+  the longer neighbour) each get their own music, crossfaded 2.5 s on alternating tracks.
+- **Music arc:** volume keyframes start the music 4 dB down under the opening narration
+  and build to full at 85 % of the film (the climax), then ease 1 dB.
+
+### Measured (journey, 720p)
+| | value |
+|---|---|
+| sound bed | ambience village → jungle → forest → jungle → beach → ocean → beach → fire; music mysterious → happy → calm |
+| loudness | -14.0 LUFS overall; 0-5 s -10.4 (title braam), 10-35 s -15.1..-15.6, 40-45 s -12.9 (climax) |
+| render | 1459 s (machine busy; colour match adds per-frame cost) |
+| Tests | 362 passed |
+
 ## 2026-11-20 — Realistic step 1: footage that shows what the story says
 
 ### Works

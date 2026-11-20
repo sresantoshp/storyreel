@@ -7,6 +7,7 @@ ffmpeg-generated clips.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import subprocess
 from pathlib import Path
@@ -309,6 +310,15 @@ def test_realistic_assemble_and_render(tmp_path: Path, media: Media) -> None:
         sfx_names = {Path(r[0]).name.split("_")[1] for r in con.execute(
             "SELECT path FROM asset WHERE name LIKE 'sfx_%'")}  # fmt: skip
         assert {"braam", "whoosh", "riser", "impact"} <= sfx_names
+        # sound bed: ambience + music on alternating tracks, crossfaded, music keyframed
+        names = {r[0] for r in con.execute("SELECT name FROM track WHERE kind='audio'")}
+        assert {"Ambience", "Ambience B", "Music", "Music B"} <= names
+        amb = [Path(r[0]).name for r in con.execute(
+            "SELECT path FROM asset WHERE name LIKE 'amb_%' ORDER BY id")]  # fmt: skip
+        # the snow scene's sound comes from its footage (ice/stream), not the kit's wind
+        assert amb[0].split("_")[2] in ("ice.wav", "stream.wav")
+        vol = con.execute("SELECT count(*) FROM keyframe WHERE param = 'volume'").fetchone()
+        assert vol[0] >= 3
         s = p.settings()
         wd = Watchdog(2**31).start()
         try:
@@ -504,3 +514,39 @@ def test_ranker_drops_drawn_and_demotes_captive(
     keys = [s.cand.key for s in r.rank("Dolphins in the ocean", pool)]
     assert "pixabay:2" not in keys  # drawn/rendered: never
     assert keys[0] == "pixabay:3"  # wild beats the aquarium (which is a duplicate here)
+
+
+# -- step 2: sound that follows the picture and the story ------------------------------
+def test_scene_ambience_from_tags() -> None:
+    beach = "beach, sea, sand, waves, summer"
+    assert real.scene_ambience("forest", [beach]) == "beach"  # beach beats its "sea" tag
+    assert real.scene_ambience("forest", ["ocean, waves", "dolphins, sea"]) == "ocean"
+    assert real.scene_ambience("forest", ["fire, night", "campfire"]) == "fire"
+    assert real.scene_ambience("jungle", ["monkey, playing", "beach"]) == "jungle"  # tie:
+    assert real.scene_ambience("jungle", ["beach", "monkey, playing"]) == "beach"  # 1st
+    assert real.scene_ambience("village", ["person, smiling"]) == "village"  # no clue
+    assert real.scene_ambience("village", []) == "village"
+
+
+def test_segments_merge_short_moods() -> None:
+    starts, durs = [0.0, 5.0, 10.0, 13.0, 30.0], [5.0, 5.0, 3.0, 17.0, 6.0]
+    keys = ["calm", "calm", "tense", "epic", "calm"]
+    assert real.segments(keys, starts, durs) == [
+        ("calm", 0.0, 10.0), ("tense", 10.0, 13.0), ("epic", 13.0, 30.0),
+        ("calm", 30.0, 36.0)]  # fmt: skip
+    merged = real.segments(keys, starts, durs, min_s=8.0)
+    assert all(b - a >= 8.0 for _, a, b in merged)
+    assert merged[0][1] == 0.0 and merged[-1][2] == 36.0
+    assert [k for k, _, _ in merged] == ["calm", "epic"]
+    assert real.segments(["sad"], [0.0], [4.0], min_s=8.0) == [("sad", 0.0, 4.0)]
+
+
+def test_music_arc_builds_to_climax() -> None:
+    curve = [real.music_arc_db(t, 100.0) for t in range(0, 101, 5)]
+    assert curve[0] == pytest.approx(-4.0)
+    assert max(curve) == pytest.approx(0.0, abs=1e-9)
+    peak = curve.index(max(curve))
+    assert 80 <= peak * 5 <= 90
+    rising = curve[: peak + 1]
+    assert all(b >= a for a, b in itertools.pairwise(rising))
+    assert -1.01 < curve[-1] < 0

@@ -218,4 +218,93 @@ def shot_match(
     return out
 
 
+# What is on screen → which procedural ambience (storyreel.audio.procedural). Checked in
+# order, so specific places win over generic ones (a beach clip is also tagged "sea").
+TAG_AMBIENCE: tuple[tuple[str, frozenset[str]], ...] = (
+    ("waterfall", frozenset({"waterfall", "waterfalls", "cascade"})),
+    ("thunderstorm", frozenset({"thunder", "lightning", "thunderstorm", "storm"})),
+    ("rain", frozenset({"rain", "raining", "rainy", "raindrops", "drizzle"})),
+    ("fire", frozenset({"campfire", "bonfire", "fire", "flame", "flames", "fireplace"})),
+    ("beach", frozenset({"beach", "shore", "seashore", "surf", "sand", "coast"})),
+    ("ocean", frozenset({"wave", "waves", "ocean", "sea", "underwater", "dolphin",
+                         "dolphins", "whale"})),
+    ("stream", frozenset({"river", "stream", "creek", "brook"})),
+    ("jungle", frozenset({"jungle", "rainforest", "monkey", "monkeys", "parrot", "macaw"})),
+    ("ice", frozenset({"snow", "ice", "glacier", "iceberg", "arctic", "frozen", "winter"})),
+    ("wind", frozenset({"desert", "dunes", "dune", "wind", "windy"})),
+    ("village", frozenset({"village", "farm", "rural", "countryside"})),
+    ("forest", frozenset({"forest", "woods", "trees", "woodland", "pine"})),
+    ("birds", frozenset({"bird", "birds", "meadow", "garden", "spring"})),
+    ("night", frozenset({"night", "stars", "moon", "milky"})),
+)  # fmt: skip
+
+
+def scene_ambience(kit_ambience: str, tag_lists: list[str]) -> str:
+    """Ambience for a scene from the tags of its shots (most votes; on a tie the earlier
+    shot wins, i.e. the wide establishing shot). The kit's ambience when no tag says
+    anything."""
+    kinds: list[str] = []
+    for tags in tag_lists:
+        words = set(_WORD.findall(tags.lower()))
+        kind = next((k for k, keys in TAG_AMBIENCE if words & keys), None)
+        if kind is not None:
+            kinds.append(kind)
+    if not kinds:
+        return kit_ambience
+    return max(kinds, key=lambda k: (kinds.count(k), -kinds.index(k)))
+
+
+def segments(
+    keys: list[str], starts: list[float], durs: list[float], min_s: float = 0.0
+) -> list[tuple[str, float, float]]:
+    """Consecutive scenes with the same key → (key, start, end). While a segment is
+    shorter than `min_s`, the shortest one joins its longer neighbour (music should not
+    change mood every few seconds)."""
+
+    def join(segs: list[tuple[str, float, float]]) -> list[tuple[str, float, float]]:
+        out: list[tuple[str, float, float]] = []
+        for k, a, b in segs:
+            if out and out[-1][0] == k:
+                out[-1] = (k, out[-1][1], b)
+            else:
+                out.append((k, a, b))
+        return out
+
+    segs = join([(k, s0, s0 + d) for k, s0, d in zip(keys, starts, durs, strict=True)])
+    while len(segs) > 1:
+        i = min(range(len(segs)), key=lambda j: segs[j][2] - segs[j][1])
+        _, a, b = segs[i]
+        if b - a >= min_s:
+            break
+        left = segs[i - 1] if i > 0 else None
+        right = segs[i + 1] if i + 1 < len(segs) else None
+        into_left = right is None or (left is not None and left[2] - left[1] >= right[2] - right[1])
+        if into_left:
+            assert left is not None
+            segs[i - 1 : i + 1] = [(left[0], left[1], b)]
+        else:
+            assert right is not None
+            segs[i : i + 2] = [(right[0], a, right[2])]
+        segs = join(segs)
+    return segs
+
+
+MUSIC_MIN_S = 8.0  # shortest stretch of one musical mood
+MUSIC_XFADE_S = 2.5
+AMB_XFADE_S = 1.5
+MUSIC_GAIN_DB = -11.0
+AMB_GAIN_DB = -10.0
+
+
+def music_arc_db(t: float, total: float) -> float:
+    """Music level over the film (dB, added to the music gain): starts 4 dB down under the
+    opening narration, builds steadily to full at 85 % (the climax), holds, eases 1 dB."""
+    if total <= 0:
+        return 0.0
+    x = t / total
+    if x <= 0.85:
+        return -4.0 + 4.0 * float((x / 0.85) ** 1.5)
+    return -1.0 * (x - 0.85) / 0.15
+
+
 SFX_GAIN_DB = {"whoosh": -13.0, "impact": -7.0, "riser": -12.0, "braam": -9.0}
