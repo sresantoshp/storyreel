@@ -20,6 +20,7 @@ from typing import Any
 from storyreel.errors import ExitCode, StoryReelError
 from storyreel.story import assemble as asm
 from storyreel.story.planner import PlanRequest, plan_story
+from storyreel.story.realistic import FindFn
 from storyreel.story.schema import StoryPlan
 
 MB = 2**20
@@ -59,6 +60,66 @@ def _voice_licence(lang: str, voice: str | None) -> str:
 
     tts_lang = lang if tts.available(lang) else "en"
     return tts.license_text(tts_lang, voice or models.DEFAULT_VOICE[tts_lang])
+
+
+def _sfx(kind: str, seconds: float, out: Path) -> Path:
+    from storyreel.audio import cinematic
+
+    return cinematic.make_sfx(kind, seconds, out)
+
+
+def _footage_finder(a: argparse.Namespace, ff: Path, fp: Path, say: Any) -> FindFn:
+    """Providers for the realistic style: --footage-dir first, then the stock libraries."""
+    from storyreel.media import stock
+    from storyreel.media.probe import probe
+    from storyreel.timebase import FLICKS
+
+    def prober(path: Path) -> tuple[int, int, float]:
+        info = probe(fp, path)
+        if not info.has_video or not info.width or not info.height:
+            raise StoryReelError(f"{path.name} has no video.")
+        return info.width, info.height, (info.duration or 0) / FLICKS
+
+    provs: list[stock.Provider] = []
+    if a.footage_dir:
+        provs.append(stock.Folder(Path(a.footage_dir), prober))
+    if a.footage != "none":
+        provs += stock.providers_from_env(a.footage)
+    if not provs and not a.offline:
+        raise StoryReelError(
+            "The realistic style needs real footage, and no source is set up.",
+            fix="Free options: set PEXELS_API_KEY (pexels.com/api) or PIXABAY_API_KEY "
+            "(pixabay.com/api/docs) with `setx NAME key` and open a new terminal; "
+            "or pass --footage-dir with your own clips.",
+        )
+    if a.offline:  # cached stock results still work without a key
+        names = {p.name for p in provs}
+        provs += [_CachedOnly(n) for n in ("pexels", "pixabay") if n not in names]
+    lib = stock.Library(provs, offline=a.offline, progress=say)
+    portrait = a.aspect in ("9:16", "4:5")
+    w, h = asm.frame_size(a.aspect, a.height)
+
+    def find(queries: list[str], seconds: float, count: int, used: set[str]) -> list[Any]:
+        return lib.find(
+            queries,
+            seconds=seconds,
+            count=count,
+            orientation="portrait" if portrait else "landscape",
+            short_side=min(w, h),
+            exclude=used,
+        )
+
+    return find
+
+
+class _CachedOnly:
+    """Offline stand-in for a stock library: only its cached searches are read."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def search(self, query: str, orientation: str, short_side: int) -> list[Any]:
+        return []
 
 
 def cmd_make(a: argparse.Namespace) -> int:
@@ -122,6 +183,9 @@ def cmd_make(a: argparse.Namespace) -> int:
         voice_licence=voice_licence,
         progress=say,
         captions=a.captions,
+        style=a.style,
+        find_footage=_footage_finder(a, ff, fp, say) if a.style == "realistic" else None,
+        sfx=_sfx if a.style == "realistic" else None,
     )
     timings["assemble_s"] = time.perf_counter() - t0
     target = parse_length(a.length)
@@ -198,6 +262,24 @@ def register(sub: Any) -> None:
     m.add_argument("--project-dir")
     m.add_argument("--no-render", action="store_true", help="build the editable project only")
     m.add_argument("--captions", action="store_true", help="also show short on-screen captions")
+    m.add_argument(
+        "--style",
+        default="animation",
+        choices=list(asm.STYLES),
+        help="animation (drawn scenery + characters) or realistic (real footage, film look, "
+        "trailer sound)",
+    )
+    m.add_argument(
+        "--footage",
+        default="auto",
+        help="realistic: footage libraries: auto (Pexels/Pixabay when a free key is set), "
+        "pexels, pixabay, commons (opt-in, uncurated, needs STORYREEL_CONTACT), a comma "
+        "list, or none",
+    )
+    m.add_argument("--footage-dir", help="realistic: folder of your own clips (used first)")
+    m.add_argument(
+        "--offline", action="store_true", help="realistic: use only footage already cached"
+    )
     m.add_argument("--json", action="store_true", help="JSON-lines progress")
     m.set_defaults(func=cmd_make)
 

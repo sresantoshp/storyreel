@@ -29,8 +29,9 @@ from storyreel.errors import StoryReelError
 from storyreel.media.importer import import_files
 from storyreel.project import store
 from storyreel.project.edits import Editor
-from storyreel.render import actors
+from storyreel.render import actors, layers
 from storyreel.story import cast as castmod
+from storyreel.story import realistic as real
 from storyreel.story import subtitles
 from storyreel.story.cast import MAX_CAST
 from storyreel.story.kits import KITS
@@ -44,6 +45,8 @@ LEAD_S = 0.4  # silence before narration starts in a scene
 TAIL_S = 0.7  # breathing room after it ends
 MIN_SCENE_S = 3.0
 XFADE_S = 0.8  # dissolve between kits
+STYLES = ("animation", "realistic")
+FADE_IN_S, FADE_OUT_S = 1.2, 1.8  # realistic: from / to black
 OVERLAY_FADE_S = 0.6
 SIZES = {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350)}
 
@@ -261,6 +264,135 @@ def _place_cast(
     return n
 
 
+def _import_footage(p: store.Project, ffmpeg: Path, ffprobe: Path, clip: Any) -> int:
+    res = import_files(p, [clip.path], ffmpeg=ffmpeg, ffprobe=ffprobe, make_proxies=False)[0]
+    if res.asset_id is None or res.status == "skipped":
+        raise StoryReelError(f"Footage {clip.path.name} could not be imported: {res.message}")
+    p.con.execute(
+        "UPDATE asset SET license = ?, source_url = ?, tags = ? WHERE id = ?",
+        (clip.licence, clip.page_url, clip.key, res.asset_id),
+    )
+    return int(res.asset_id)
+
+
+def _realistic_picture(
+    ed: Editor,
+    p: store.Project,
+    plan: StoryPlan,
+    starts: list[float],
+    durs: list[float],
+    total: float,
+    rate: Rate,
+    tracks: list[int],
+    w: int,
+    h: int,
+    k: float,
+    find: real.FindFn,
+    ffmpeg: Path,
+    ffprobe: Path,
+    root: Path,
+    say: Progress,
+) -> None:
+    """Footage shots with a slow push-in, the film grade, letterbox bars, fades."""
+    foot_t, grade_t, top_t, bot_t, fade_t = tracks[0], *tracks[-4:]
+    shots = real.plan_shots(plan.scenes, starts, durs, find)
+    say(f"footage: {len(shots)} shots from {len({s.clip.key for s in shots})} clips")
+    assets: dict[str, int] = {}
+    for n, shot in enumerate(shots):
+        if shot.clip.key not in assets:
+            assets[shot.clip.key] = _import_footage(p, ffmpeg, ffprobe, shot.clip)
+        aid = assets[shot.clip.key]
+        aw, ah = p.con.execute("SELECT width, height FROM asset WHERE id = ?", (aid,)).fetchone()
+        c0, c1 = _snap(rate, shot.start_s), _snap(rate, shot.start_s + shot.length_s)
+        alen = _snap_down(rate, _asset_len(p, aid))
+        src_in = _snap(rate, 1.0) if alen >= c1 - c0 + _snap(rate, 1.0) else 0
+        dur = min(c1 - c0, alen - src_in)
+        cid = ed.add_clip(foot_t, c0, dur, asset_id=aid, src_in=src_in)
+        # media fits inside the frame; scale up to cover it (no side/top bars from footage)
+        fw, fh = layers.fit_size(int(aw), int(ah), w, h)
+        cover = max(w / fw, h / fh)
+        drift = (1 if n % 2 else -1) * round(0.012 * w)
+        ed.ken_burns(cid, zoom_from=cover, zoom_to=cover * real.PUSH_IN, pan_x=drift, ease="linear")
+    real.credits_path(root).write_text(real.credits(shots), encoding="utf-8")
+
+    end = _snap(rate, total)
+    grade = ed.add_clip(grade_t, 0, end, kind="adjust")
+    for etype, params in real.film_grade(k):
+        ed.add_effect(grade, etype, **params)
+    bar = real.letterbox_bar(w, h)
+    if bar:
+        for t_id, sign in ((top_t, -1), (bot_t, 1)):
+            ed.add_clip(
+                t_id, 0, end, color="#000000",
+                props={"scale_y": bar / h, "y": sign * (h - bar) / 2},
+            )  # fmt: skip
+    fin, fout = _snap(rate, real_fade(FADE_IN_S, total)), _snap(rate, real_fade(FADE_OUT_S, total))
+    a = ed.add_clip(fade_t, 0, fin, color="#000000")
+    ed.add_keyframe(a, "opacity", 0, 1.0)
+    ed.add_keyframe(a, "opacity", fin, 0.0)
+    b = ed.add_clip(fade_t, end - fout, fout, color="#000000")
+    ed.add_keyframe(b, "opacity", 0, 0.0)
+    ed.add_keyframe(b, "opacity", fout, 1.0)
+
+
+def real_fade(seconds: float, total: float) -> float:
+    return min(seconds, total / 4)
+
+
+def _realistic_sound(
+    ed: Editor,
+    p: store.Project,
+    starts: list[float],
+    total: float,
+    rate: Rate,
+    sfx: SoundFn,
+    media: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    say: Progress,
+) -> None:
+    """Voice chain, trailer effects on two fx tracks, hall on fx, glue on the master."""
+    for etype, params in real.VOICE_CHAIN:
+        ed.add_bus_effect("dialogue", etype, **params)
+    for etype, fparams in real.FX_CHAIN:
+        ed.add_bus_effect("fx", etype, **fparams)
+    for etype, params in real.MASTER_CHAIN:
+        ed.add_bus_effect("master", etype, **params)
+    whoosh_t, hits_t = ed.add_track("audio", "Whooshes"), ed.add_track("audio", "Hits")
+    for t_id in (whoosh_t, hits_t):
+        ed.set_track(t_id, bus="fx")
+    end = _snap(rate, total)
+    cache: dict[tuple[str, float], int] = {}
+
+    def place(track: int, kind: str, t0: float, seconds: float) -> None:
+        key = (kind, round(seconds, 2))
+        if key not in cache:
+            f = sfx(kind, seconds, media / f"sfx_{kind}_{seconds:.2f}.wav")
+            cache[key] = _import_generated(p, ffmpeg, ffprobe, f, "procedural (CC0)")
+        aid = cache[key]
+        c0 = max(0, _snap(rate, t0))
+        ln = min(_snap_down(rate, _asset_len(p, aid)), end - c0)
+        if ln > 0:
+            ed.add_clip(track, c0, ln, asset_id=aid, gain_db=real.SFX_GAIN_DB[kind])
+
+    cuts = starts[1:]
+    final = cuts[-1] if len(cuts) >= 2 else None
+    braam_s = min(4.0, starts[1] if len(starts) > 1 else total)
+    place(hits_t, "braam", 0.0, max(0.5, braam_s))
+    w_len = 1.4
+    for c in cuts:
+        if c == final:
+            continue
+        place(whoosh_t, "whoosh", c - w_len * 0.65, w_len)
+    n = len(cuts) - (1 if final is not None else 0)
+    if final is not None:
+        rise = min(4.0, final - braam_s - 0.2)
+        if rise >= 1.5:
+            place(hits_t, "riser", final - rise, rise)
+        place(hits_t, "impact", final, min(3.5, total - final))
+    say(f"sound design: braam, {n} whooshes" + (", riser + impact" if final else ""))
+
+
 def assemble(
     plan: StoryPlan,
     root: Path,
@@ -275,7 +407,17 @@ def assemble(
     voice_licence: str = "TTS",
     progress: Progress | None = None,
     captions: bool = False,
+    style: str = "animation",
+    find_footage: real.FindFn | None = None,
+    sfx: SoundFn | None = None,
 ) -> Assembled:
+    """style 'animation' = drawn kits + puppets; 'realistic' = real footage (find_footage),
+    film grade, letterbox and trailer sound design (sfx). The two never mix."""
+    if style not in STYLES:
+        raise StoryReelError(f"Unknown style {style!r}.", fix=f"Use one of {', '.join(STYLES)}.")
+    realistic = style == "realistic"
+    if realistic and (find_footage is None or sfx is None):
+        raise StoryReelError("The realistic style needs a footage finder and sound effects.")
     say = progress or (lambda m: None)
     w, h = frame_size(aspect, height)
     k = h / 1080 if w >= h else w / 1080  # text scale relative to a 1080-wide short side
@@ -288,11 +430,13 @@ def assemble(
     )
     try:
         ed = Editor(p.con)
-        n_layers = max(len(KITS[s.kit].layers) for s in plan.scenes)
+        # animation: kit layers + puppets; realistic: footage, grade, 2 bars, fade
+        n_layers = 1 if realistic else max(len(KITS[s.kit].layers) for s in plan.scenes)
+        n_pic = n_layers + (4 if realistic else MAX_CAST)
         vtracks = [p.con.execute("SELECT id FROM track WHERE kind='video'").fetchone()[0]]
-        while len(vtracks) < n_layers + MAX_CAST + 2:
+        while len(vtracks) < n_pic + 2:
             vtracks.append(ed.add_track("video"))
-        title_t, sub_t = vtracks[n_layers + MAX_CAST], vtracks[n_layers + MAX_CAST + 1]
+        title_t, sub_t = vtracks[n_pic], vtracks[n_pic + 1]
         dia_t = p.con.execute("SELECT id FROM track WHERE kind='audio'").fetchone()[0]
         amb_t, mus_t = ed.add_track("audio", "Ambience"), ed.add_track("audio", "Music")
         ed.set_track(amb_t, bus="ambience")
@@ -335,7 +479,7 @@ def assemble(
         for r, (kit_name, r0, r1) in enumerate(runs):
             kit = KITS[kit_name]
             c0, c1 = _snap(rate, r0), _snap(rate, r1)
-            for j, (gtype, params) in enumerate(kit.layers):
+            for j, (gtype, params) in enumerate([] if realistic else kit.layers):
                 cid = ed.add_clip(
                     vtracks[j], c0, c1 - c0, kind="generator", props={"type": gtype, **params}
                 )
@@ -358,12 +502,20 @@ def assemble(
             cid = ed.add_clip(amb_t, c0, alen, asset_id=aid, gain_db=-10.0)
             ed.set_props(cid, fade_in=min(1.0, (r1 - r0) / 3), fade_out=min(1.0, (r1 - r0) / 3))
 
-        # 2b. characters: one clip per species per stretch of consecutive scenes it is in
-        n_actor_clips = _place_cast(
-            ed, plan, starts, durs, runs, rate, vtracks[n_layers : n_layers + MAX_CAST], w, h
-        )
-        if n_actor_clips:
-            say(f"characters: {n_actor_clips} animated clip(s)")
+        if realistic:
+            assert find_footage is not None and sfx is not None
+            _realistic_picture(
+                ed, p, plan, starts, durs, total, rate, vtracks[:n_pic], w, h, k,
+                find_footage, ffmpeg, ffprobe, root, say,
+            )  # fmt: skip
+            _realistic_sound(ed, p, starts, total, rate, sfx, media, ffmpeg, ffprobe, say)
+        else:
+            # 2b. characters: one clip per species per stretch of consecutive scenes
+            n_actor_clips = _place_cast(
+                ed, plan, starts, durs, runs, rate, vtracks[n_layers : n_layers + MAX_CAST], w, h
+            )
+            if n_actor_clips:
+                say(f"characters: {n_actor_clips} animated clip(s)")
 
         # 3. music: one bed in the story's dominant mood
         mood = Counter(s.mood for s in plan.scenes).most_common(1)[0][0]
@@ -380,15 +532,29 @@ def assemble(
             _snap(rate, 0.3),
             _snap(rate, min(4.5, durs[0] - 0.3)),
             kind="text",
-            props={
-                "text": plan.title,
-                "size": round(92 * k),
-                "anim": "pop",
-                "outline": 3.0,
-                "shadow": 6.0,
-                "y": round(-0.3 * h),
-                "max_width": round(0.85 * w),
-            },
+            props=(
+                {
+                    "text": plan.title.upper(),
+                    "size": round(78 * k),
+                    "anim": "fade",
+                    "anim_unit": "letter",
+                    "anim_stagger": 0.05,
+                    "anim_duration": 1.2,
+                    "shadow": 10.0,
+                    "shadow_color": "#000000",
+                    "max_width": round(0.8 * w),
+                }
+                if realistic
+                else {
+                    "text": plan.title,
+                    "size": round(92 * k),
+                    "anim": "pop",
+                    "outline": 3.0,
+                    "shadow": 6.0,
+                    "y": round(-0.3 * h),
+                    "max_width": round(0.85 * w),
+                }
+            ),
         )
         for scene, s0, d in list(zip(plan.scenes, starts, durs, strict=True))[1:]:
             if captions and scene.onscreen and d > 2.5:
@@ -418,6 +584,14 @@ def assemble(
                 end = min(c.end + 0.25, limit)
                 if end > c.start:
                     cues.append(subtitles.Cue(c.start, end, c.text))
+        bar = real.letterbox_bar(w, h) if realistic else 0
+        sub_style: dict[str, Any] = (
+            {"size": round(40 * k), "y": round((h - bar) / 2), "line_spacing": 1.1,
+             "color": "#f2f2f2"}
+            if bar >= round(90 * k)  # subtitles sit in the bottom letterbox bar, like cinema
+            else {"size": round(44 * k), "box": True, "box_opacity": 0.55,
+                  "box_padding": round(14 * k), "y": round(0.41 * h), "line_spacing": 1.15}
+        )  # fmt: skip
         prev_end = 0
         for c in cues:
             c0, c1 = max(_snap(rate, c.start), prev_end), _snap(rate, c.end)
@@ -428,15 +602,7 @@ def assemble(
                     c0,
                     c1 - c0,
                     kind="text",
-                    props={
-                        "text": c.text,
-                        "size": round(44 * k),
-                        "box": True,
-                        "box_opacity": 0.55,
-                        "box_padding": round(14 * k),
-                        "y": round(0.41 * h),
-                        "line_spacing": 1.15,
-                    },
+                    props={"text": c.text, **sub_style},
                 )
         srt = root / "subtitles.srt"
         subtitles.write_srt(cues, srt)

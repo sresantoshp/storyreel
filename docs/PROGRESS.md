@@ -1,5 +1,53 @@
 # Progress
 
+## 2026-11-19 — Realistic style (`storyreel make --style realistic`)
+
+A second, separate video type next to the animation style: real footage cut like a film,
+a film grade and trailer sound. The two styles never mix: a realistic video never falls back
+to drawn scenery or puppets; a scene without footage stops with a fix.
+
+### Works
+- **Footage (media/stock.py):** your own clip folder (`--footage-dir`, matched by file
+  names), Pixabay (`PIXABAY_API_KEY`, live action only via `video_type=film`), Pexels
+  (`PEXELS_API_KEY`; new keys paused by Pexels as of 2026-11-19). Searches and downloads
+  are cached in the data dir; `--offline` re-makes from the cache. Licence, author and page
+  of every clip go into the project and `footage_credits.txt`.
+- **Wikimedia Commons:** opt-in only (`--footage commons` + `STORYREEL_CONTACT`). Without
+  a contact User-Agent downloads get HTTP 429, and results are uncurated (a "village" search
+  returned war and ritual footage), so it is never automatic.
+- **Shots (story/realistic.py):** searches per scene ranked animal → named thing → the
+  kit's main shot → people → other kit shots; scenes split into 3.5-6 s shots, each with a
+  slow push-in and drift, scaled to cover the frame; no clip repeats in a story.
+- **Look:** one adjustment layer (soft S-curve with lifted blacks, warm highlights / cool
+  shadows, halation glow, vignette, grain), 2.39:1 letterbox bars, subtitles inside the
+  bottom bar, letter-by-letter title fade, fade from/to black.
+- **Sound (audio/cinematic.py, numpy, CC0):** braam under the title, whoosh peaking on
+  every scene cut, riser into the last scene + impact on its first frame, hall reverb on
+  the fx bus; dialogue chain (high-pass, de-mud, presence, air, 3:1 compression,
+  de-esser); master glue compressor; -14 LUFS master as before.
+
+### Measured (i3-1315U, ~0.5-1 GB RAM free)
+| | value |
+|---|---|
+| journey story, 9 scenes, 720p, Pixabay | 47.3 s video, 9 shots from 9 clips |
+| ... voice + footage + assembly | 139-245 s (footage downloads 1-4 s per clip, 2-15 MB) |
+| ... render | 692-767 s (≈1.9 fps) |
+| ... peak RSS | 818 MB |
+| ... loudness | -14.0 LUFS, -1.5 dBFS peak |
+| SFX synthesis | whoosh 0.2 s, riser 0.7 s, braam 1.2 s, impact 0.3-1.7 s |
+| Tests | 349 + new tests/test_realistic.py (22) |
+
+### Bugs found (fixed)
+- Pixabay returned an anime illustration for "girl night": live-action filter added and
+  people searches moved after the scene's main shot.
+- Braam additive synthesis took 11 s: replaced by filtered detuned saws (1.2 s).
+
+### Honest limits
+- Stock footage cannot keep the same characters across shots; the story's people do not
+  appear. Best for nature/documentary-style narration.
+- Weak matches still happen (the dolphin scene showed plain aerial water).
+- Rendering ≈2 fps at 720p on this laptop.
+
 ## 2026-11-17 — Phase 4: story → video (`storyreel make`), characters, environments
 
 One command turns an idea (or your own script, or a saved plan) into a finished video,

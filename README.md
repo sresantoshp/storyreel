@@ -27,6 +27,34 @@ python -m uv sync
 .venv/Scripts/storyreel info myfilm.storyreel --clips
 ```
 
+## Story to video: two styles
+
+```
+# animation: drawn scenery, animated characters, procedural ambience and music (fully offline)
+.venv/Scripts/storyreel make --idea "a fox finds a lost cub" --length 60s --out fox.mp4
+
+# realistic: real footage cut like a film, film grade, 2.39:1 letterbox, trailer sound design
+.venv/Scripts/storyreel make --idea "a fox finds a lost cub" --style realistic --out fox_real.mp4
+```
+
+The two styles never mix: a realistic video uses only real footage and stops with a fix if a
+scene has none. Footage sources, all free with commercial use allowed (checked in this order):
+
+| source | setup | licence |
+|---|---|---|
+| your clips | `--footage-dir D:\clips` (name files by what they show: `forest_fox.mp4`) | yours |
+| Pexels | free key: `setx PEXELS_API_KEY <key>` (pexels.com/api), new terminal | no credit needed |
+| Pixabay | free key: `setx PIXABAY_API_KEY <key>` (pixabay.com/api/docs) | no credit needed |
+| Wikimedia Commons | opt-in only: `--footage commons` + `setx STORYREEL_CONTACT <email>` | public domain / CC0 / CC BY; credits in `footage_credits.txt` |
+
+Searches and downloads are cached (`%LOCALAPPDATA%\StoryReel\stock`), so a re-make works
+offline (`--offline`). Pexels and Pixabay are curated and look best. Commons is not curated
+(war, ritual and medical footage turn up for innocent searches), so it is never used
+automatically; check every shot if you turn it on.
+
+Sound in the realistic style: a broadcast voice chain (EQ, compression, de-esser), a braam under the title, whooshes on cuts, a riser into the final
+scene and an impact on it, hall reverb on effects, master glue compression, −14 LUFS.
+
 Demo: `python examples/phase2_demo.py` (18 s animated scene, CLI only, offline).
 Audio demo: `python examples/phase3_audio_demo.py` (60 s 4-track mix to -14 LUFS with stems).
 
