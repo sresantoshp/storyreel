@@ -1,5 +1,39 @@
 # Progress
 
+## 2026-11-20 — Realistic step 1: footage that shows what the story says
+
+### Works
+- **CLIP matching (vision/clip.py, media/rank.py):** OpenAI CLIP ViT-B/32 (MIT; Xenova
+  int8 ONNX, pinned revision, SHA-256 verified, 146 MB, used offline). Each candidate's
+  preview is scored against the narration (0.6) and its search words (0.4), plus a bonus
+  when the library's own tags confirm the words of a specific search. Weak matches,
+  near-duplicates, drawn/CGI-tagged clips are dropped; zoo/aquarium clips are demoted.
+  Shots within a scene go wide → close. `--no-match` turns it off.
+- **Pixabay:** AI-generated and low-quality clips are skipped (API flags); previews and
+  tags kept. Search cache is versioned (v2) so old entries without them are re-fetched.
+- **Shot colour matching:** every shot moves part of the way towards the story's median
+  Lab look (colormatch effect), so cuts between cameras stop jumping.
+- **Vertical videos** can use landscape footage (centre crop; files tall enough).
+- **ffmpeg hang guard:** ffmpeg >= 7 prints progress on a timer even when stuck, so the
+  heartbeat now needs moving output; a hung step is killed after 60 s and run once more.
+
+### Measured
+| | value |
+|---|---|
+| CLIP load / 9 frames / 1 text | ~1.5 s / 1.25 s / ~15 ms |
+| journey (9 scenes) footage step, previews uncached | ~140 s of 278 s make-before-render |
+| journey render 720p with colour match | 530 s resumed (3 of 6 chunks cached) |
+| loudness | -14.2 LUFS, -1.3 dBTP |
+| Tests | 357 full suite + new ranking/cache/hang tests |
+
+### Bugs found (fixed)
+- Render froze for an hour: stuck ffmpeg kept printing progress (see hang guard).
+- Cached Pixabay searches had no tags, so the dolphin scene lost to plain waves.
+
+### Honest limits
+- CLIP reads English only (Hindi stories rank by search words alone).
+- It does not know the story's setting: a "forest" after a jungle can still be any forest.
+
 ## 2026-11-19 — Realistic style (`storyreel make --style realistic`)
 
 A second, separate video type next to the animation style: real footage cut like a film,

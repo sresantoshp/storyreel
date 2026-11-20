@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -48,9 +49,45 @@ PY = sys.executable
 
 def test_runner_kills_hung_process() -> None:
     t0 = time.monotonic()
-    with pytest.raises(ToolTimeoutError, match="stopped responding"):
+    with pytest.raises(ToolTimeoutError, match="made no progress"):
         run_ffmpeg([PY, "-c", "import time; time.sleep(30)"], limit_bytes=None, heartbeat_s=1.0)
+    assert time.monotonic() - t0 < 8  # killed twice (one retry)
+
+
+# ffmpeg >= 7 keeps printing progress blocks while its pipeline is stuck
+_STUCK = """
+import time
+while True:
+    print("out_time_us=1000", "total_size=48", "progress=continue", sep="\\n", flush=True)
+    time.sleep(0.2)
+"""
+_MOVING = """
+import time
+for i in range(15):
+    print(f"out_time_us={i}", "progress=continue", sep="\\n", flush=True)
+    time.sleep(0.2)
+"""
+
+
+def test_runner_treats_repeated_progress_as_hung() -> None:
+    t0 = time.monotonic()
+    with pytest.raises(ToolTimeoutError, match="made no progress"):
+        run_ffmpeg([PY, "-c", _STUCK], limit_bytes=None, heartbeat_s=1.0, hang_retries=0)
     assert time.monotonic() - t0 < 5
+    run_ffmpeg([PY, "-c", _MOVING], limit_bytes=None, heartbeat_s=1.0)  # 3 s, never idle 1 s
+
+
+def test_runner_retries_a_hang_once(tmp_path: Path) -> None:
+    flag = tmp_path / "ran_once"
+    code = f"""
+import pathlib, time
+f = pathlib.Path({str(flag)!r})
+if not f.exists():
+    f.write_text("x")
+    time.sleep(30)
+"""
+    run_ffmpeg([PY, "-c", code], limit_bytes=None, heartbeat_s=1.0)  # 2nd attempt succeeds
+    assert flag.exists()
 
 
 def test_runner_reports_failure_with_stderr_tail() -> None:

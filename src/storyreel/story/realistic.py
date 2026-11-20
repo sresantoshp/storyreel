@@ -21,6 +21,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from storyreel.errors import StoryReelError
 from storyreel.media import stock
 from storyreel.story import cast as castmod
@@ -111,8 +113,8 @@ class Shot:
     clip: stock.Clip
 
 
-FindFn = Callable[[list[str], float, int, set[str]], list[stock.Clip]]
-# (queries, min seconds, count, keys already used) -> clips
+FindFn = Callable[[list[str], str, float, int, set[str]], list[stock.Clip]]
+# (queries, narration to match, min seconds, count, keys already used) -> clips
 
 
 def plan_shots(
@@ -125,9 +127,10 @@ def plan_shots(
     for i, (scene, s0, d) in enumerate(zip(scenes, starts, durs, strict=True)):
         lengths = shot_lengths(d)
         need = max(lengths) + 1.0  # skip the first second of each clip (often a shaky start)
-        clips = find(scene_queries(scene), need, len(lengths), used)
+        describe = scene.narration if scene.narration.isascii() else ""  # CLIP: English
+        clips = find(scene_queries(scene), describe, need, len(lengths), used)
         if not clips:  # reuse rather than fail: still real footage
-            clips = find(scene_queries(scene), need, len(lengths), set())
+            clips = find(scene_queries(scene), describe, need, len(lengths), set())
         if not clips:
             raise StoryReelError(
                 f"No footage found for scene {i + 1} ({scene.kit}: {scene.narration[:50]!r}).",
@@ -189,4 +192,30 @@ MASTER_CHAIN: list[tuple[str, dict[str, float]]] = [
     ("compressor", {"threshold": -16.0, "ratio": 2.0, "attack": 25.0, "release": 250.0,
                     "makeup": 1.0}),
 ]  # fmt: skip
+
+
+def shot_match(
+    stats: list[tuple[list[float], list[float]]],
+) -> list[dict[str, list[float] | float]]:
+    """Colour-match parameters per shot (Lab mean/std from a frame of each): every shot
+    moves part of the way towards the story's average look, so cuts between clips from
+    different cameras stop jumping, while a campfire stays warmer than the sea."""
+    if not stats:
+        return []
+    ref_m = np.median(np.array([m for m, _ in stats]), axis=0)
+    ref_s = np.median(np.array([s for _, s in stats]), axis=0)
+    pull_m = np.array([0.3, 0.5, 0.5])  # L (exposure) less than a/b (tint)
+    out: list[dict[str, list[float] | float]] = []
+    for m, sd in stats:
+        mm, ss = np.array(m), np.array(sd)
+        out.append({
+            "src_mean": [round(float(x), 4) for x in mm],
+            "src_std": [round(float(x), 4) for x in ss],
+            "dst_mean": [round(float(x), 4) for x in mm + pull_m * (ref_m - mm)],
+            "dst_std": [round(float(x), 4) for x in ss + 0.5 * (ref_s - ss)],
+            "mix": 1.0,
+        })  # fmt: skip
+    return out
+
+
 SFX_GAIN_DB = {"whoosh": -13.0, "impact": -7.0, "riser": -12.0, "braam": -9.0}

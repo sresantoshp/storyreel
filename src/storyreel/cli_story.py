@@ -95,18 +95,36 @@ def _footage_finder(a: argparse.Namespace, ff: Path, fp: Path, say: Any) -> Find
     if a.offline:  # cached stock results still work without a key
         names = {p.name for p in provs}
         provs += [_CachedOnly(n) for n in ("pexels", "pixabay") if n not in names]
-    lib = stock.Library(provs, offline=a.offline, progress=say)
-    portrait = a.aspect in ("9:16", "4:5")
-    w, h = asm.frame_size(a.aspect, a.height)
+    ranker = None
+    if not a.no_match:
+        from storyreel.media.rank import Ranker
+        from storyreel.vision import frames
+        from storyreel.vision.clip import Clip
 
-    def find(queries: list[str], seconds: float, count: int, used: set[str]) -> list[Any]:
+        say("footage matching: loading CLIP")
+        ranker = Ranker(
+            Clip(progress=say),
+            stock.default_cache(),
+            lambda path: frames.grab(ff, path),
+            offline=a.offline,
+        )
+    lib = stock.Library(provs, offline=a.offline, progress=say, ranker=ranker)
+    w, h = asm.frame_size(a.aspect, a.height)
+    # vertical videos also take landscape footage (centre-cropped by the cover scale),
+    # so the file must be tall enough: ask for the frame's long side as its short side
+    portrait = h > w
+
+    def find(
+        queries: list[str], describe: str, seconds: float, count: int, used: set[str]
+    ) -> list[Any]:
         return lib.find(
             queries,
             seconds=seconds,
             count=count,
-            orientation="portrait" if portrait else "landscape",
-            short_side=min(w, h),
+            orientation="any" if portrait else "landscape",
+            short_side=max(w, h) if portrait else min(w, h),
             exclude=used,
+            describe=describe,
         )
 
     return find
@@ -279,6 +297,12 @@ def register(sub: Any) -> None:
     m.add_argument("--footage-dir", help="realistic: folder of your own clips (used first)")
     m.add_argument(
         "--offline", action="store_true", help="realistic: use only footage already cached"
+    )
+    m.add_argument(
+        "--no-match",
+        action="store_true",
+        help="realistic: take the first search hits instead of matching previews to the "
+        "narration with CLIP (faster, worse picks)",
     )
     m.add_argument("--json", action="store_true", help="JSON-lines progress")
     m.set_defaults(func=cmd_make)

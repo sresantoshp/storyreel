@@ -52,6 +52,10 @@ offline (`--offline`). Pexels and Pixabay are curated and look best. Commons is 
 (war, ritual and medical footage turn up for innocent searches), so it is never used
 automatically; check every shot if you turn it on.
 
+Footage is chosen by CLIP (a small open model, 146 MB, downloaded once): every candidate's
+preview is scored against the narration, so "playful monkeys" gets monkeys playing, not a
+monkey portrait. Drawn/CGI clips are never used. `--no-match` skips this (faster).
+
 Sound in the realistic style: a broadcast voice chain (EQ, compression, de-esser), a braam under the title, whooshes on cuts, a riser into the final
 scene and an impact on it, hall reverb on effects, master glue compression, −14 LUFS.
 

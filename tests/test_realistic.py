@@ -6,9 +6,11 @@ ffmpeg-generated clips.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -73,8 +75,9 @@ def test_plan_shots_no_repeats_and_no_footage_fails() -> None:
     calls: list[set[str]] = []
     pool = [_clip(f"pexels:{i}") for i in range(10)]
 
-    def find(q: list[str], secs: float, n: int, used: set[str]) -> list[stock.Clip]:
+    def find(q: list[str], d: str, secs: float, n: int, used: set[str]) -> list[stock.Clip]:
         calls.append(set(used))
+        assert d in ("a", "b")
         return [c for c in pool if c.key not in used][:n]
 
     shots = real.plan_shots(scenes, [0.0, 12.0], [12.0, 5.0], find)
@@ -264,7 +267,7 @@ def test_realistic_assemble_and_render(tmp_path: Path, media: Media) -> None:
     folder = stock.Folder(lib, lambda p: (480, 270, 9.0))
     library = stock.Library([folder], tmp_path / "cache")
 
-    def find(q: list[str], secs: float, n: int, used: set[str]) -> list[stock.Clip]:
+    def find(q: list[str], d: str, secs: float, n: int, used: set[str]) -> list[stock.Clip]:
         # every scene finds something: fall back to any clip, like a broad stock search
         return library.find(
             [*q, "sky"], seconds=secs, count=n, orientation="landscape", short_side=180,
@@ -330,3 +333,174 @@ def test_realistic_assemble_and_render(tmp_path: Path, media: Media) -> None:
     mid = img[1]
     assert mid[: bar - 2].mean() < 16 and mid[s.height - bar + 2 :].mean() < 16
     assert mid[bar + 4 : s.height - bar - 4].mean() > 30
+
+
+# -- CLIP ranking (fake embedder: one axis per concept) ----------------------------------
+CONCEPTS = ["dolphin", "aquarium", "ocean", "landscape", "close"]
+
+
+def _vec(*names: str) -> np.ndarray:
+    v = np.zeros(len(CONCEPTS), np.float32)
+    for n in names:
+        v[CONCEPTS.index(n)] = 1.0
+    out: np.ndarray = v / np.linalg.norm(v)
+    return out
+
+
+class FakeClip:
+    """Images are tagged by their first pixel's red value; texts by the words in them."""
+
+    looks: ClassVar[dict[int, tuple[str, ...]]] = {
+        1: ("dolphin", "ocean", "close"),
+        2: ("aquarium",),
+        3: ("ocean", "landscape"),
+        4: ("dolphin", "ocean", "landscape"),
+    }
+
+    def texts(self, texts: list[str]) -> np.ndarray:
+        rows = []
+        for t in texts:
+            names = [c for c in CONCEPTS if c in t] or ["landscape"]
+            if "wide" in t:
+                names = ["landscape"]
+            rows.append(_vec(*names) * 0.3)  # real CLIP similarities are ~0.3
+        return np.array(rows, np.float32)
+
+    def images(self, rgbs: list[np.ndarray]) -> np.ndarray:
+        return np.array([_vec(*self.looks[int(x[0, 0, 0])]) for x in rgbs], np.float32)
+
+
+def _cand(i: int) -> stock.Candidate:
+    return stock.Candidate(f"pixabay:{i}", 1280, 720, 20.0, f"https://v/{i}", "", "", "L",
+                           thumb=f"https://t/{i}.jpg")  # fmt: skip
+
+
+def test_ranker_prefers_narration_match_and_orders_wide_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from storyreel.media import rank
+
+    def fake_preview(self: rank.Ranker, c: stock.Candidate) -> np.ndarray:
+        img = np.zeros((4, 4, 3), np.uint8)
+        img[0, 0, 0] = int(c.key.split(":")[1])
+        return img
+
+    monkeypatch.setattr(rank.Ranker, "preview", fake_preview)
+    r = rank.Ranker(FakeClip(), tmp_path, lambda p: None)
+    pool = [(0, "dolphin ocean", _cand(i)) for i in (2, 3, 1, 4)]
+    ranked = r.rank("Dolphins dance in the ocean", pool)
+    keys = [s.cand.key for s in ranked]
+    assert keys[:2] in (["pixabay:1", "pixabay:4"], ["pixabay:4", "pixabay:1"])
+    assert "pixabay:2" not in keys  # the aquarium crowd is rejected
+    clips = [_clip(k) for k in keys[:2]]
+    ordered = r.wide_first(clips, {s.cand.key: s for s in ranked})
+    assert [c.key for c in ordered] == ["pixabay:4", "pixabay:1"]  # wide, then close
+
+
+def test_library_uses_ranker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from storyreel.media import rank
+
+    class Fixed:
+        def __init__(self) -> None:
+            self.pool: list[tuple[int, str, stock.Candidate]] = []
+
+        def rank(self, describe: str, pool: list[Any]) -> list[rank.Scored]:
+            self.pool = pool
+            return [rank.Scored(c, 1.0, np.zeros(2, np.float32)) for _, _, c in reversed(pool)]
+
+        def wide_first(self, clips: list[stock.Clip], scored: Any) -> list[stock.Clip]:
+            return clips
+
+    monkeypatch.setattr(stock.Library, "_download", lambda self, c, dest: True)
+    fixed = Fixed()
+    lib = stock.Library([FakeProvider([_cand(i) for i in range(3)])], tmp_path,
+                        ranker=fixed)  # type: ignore[arg-type]  # fmt: skip
+    got = lib.find(["a", "b"], seconds=5, count=2, orientation="landscape", short_side=720,
+                   exclude={"pixabay:0"}, describe="x")  # fmt: skip
+    assert [c.key for c in got] == ["pixabay:2", "pixabay:1"]
+    assert [c.key for _, _, c in fixed.pool] == ["pixabay:1", "pixabay:2"]  # no duplicates
+
+
+def test_pixabay_skips_ai_and_low_quality(monkeypatch: pytest.MonkeyPatch) -> None:
+    def hit(i: int, **flags: bool) -> dict[str, Any]:
+        return {"id": i, "duration": 10, "pageURL": "", "user": "u", "tags": "sea, waves",
+                "videos": {"medium": {"width": 1280, "height": 720, "url": "https://m",
+                                      "thumbnail": f"https://t/{i}.jpg"}}, **flags}  # fmt: skip
+
+    data = {"hits": [hit(1), hit(2, isAiGenerated=True), hit(3, isLowQuality=True)]}
+    monkeypatch.setattr(stock, "_get_json", lambda url, headers, timeout=30: data)
+    hits = stock.Pixabay("k").search("sea", "landscape", 720)
+    assert [(h.key, h.thumb, h.tags) for h in hits] == [
+        ("pixabay:1", "https://t/1.jpg", "sea, waves")]  # fmt: skip
+
+
+def test_shot_match_pulls_towards_story_average() -> None:
+    warm = ([60.0, 20.0, 40.0], [20.0, 10.0, 10.0])
+    cool = ([50.0, -5.0, -20.0], [10.0, 5.0, 8.0])
+    mid = ([55.0, 5.0, 5.0], [15.0, 6.0, 9.0])
+    p = real.shot_match([warm, cool, mid])
+    ref = np.array(mid[0])
+    for (m, _), q in zip([warm, cool, mid], p, strict=True):
+        moved = np.abs(np.array(q["dst_mean"]) - ref)
+        assert np.all(moved <= np.abs(np.array(m) - ref) + 1e-6)  # never further away
+        assert q["src_mean"] == m
+    assert p[0]["dst_mean"][1] > p[1]["dst_mean"][1]  # the warm shot stays warmer
+
+
+@needs_ffmpeg
+def test_grab_frame(tmp_path: Path, media: Media) -> None:
+    from storyreel.vision.frames import grab
+
+    clip = _footage(media.ffmpeg, tmp_path / "c.mp4", "testsrc2")
+    img = grab(media.ffmpeg, clip, at_s=2.0, width=160)
+    assert img is not None and img.shape == (90, 160, 3) and img.dtype == np.uint8
+    assert grab(media.ffmpeg, clip, width=64) is not None
+    assert grab(media.ffmpeg, tmp_path / "missing.mp4") is None
+
+
+def test_tag_match() -> None:
+    from storyreel.media.rank import _tag_match
+
+    c = stock.Candidate("pixabay:1", 1, 1, 1.0, "", "", "", "L", tags="ocean, dolphins, sea")
+    assert _tag_match("dolphin ocean", c) == 1.0
+    assert _tag_match("tiger jungle", c) == 0.0
+    f = stock.Candidate("folder:jungle/tiger_walk.mp4", 1, 1, 1.0, "", "", "", "L")
+    assert _tag_match("tiger jungle", f) == 1.0
+
+
+def test_search_cache_versioned(tmp_path: Path) -> None:
+    old = [stock.Candidate("pixabay:1", 1920, 1080, 20.0, "https://f/1", "", "", "L")]
+    lib = stock.Library([FakeProvider([])], tmp_path, offline=True)
+    legacy = lib._search_file("pexels", "sea|landscape|720")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps([dataclasses.asdict(c) for c in old]), encoding="utf-8")
+    assert [c.key for c in lib._search(FakeProvider([]), "sea", "landscape", 720)] == [
+        "pixabay:1"]  # offline: the old cache still works  # fmt: skip
+    fresh = FakeProvider([_cand(7)])
+    online = stock.Library([fresh], tmp_path)
+    assert [c.key for c in online._search(fresh, "sea", "landscape", 720)] == ["pixabay:7"]
+    assert fresh.calls == 1  # online: re-searched, so previews and tags are filled in
+
+
+def test_ranker_drops_drawn_and_demotes_captive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from storyreel.media import rank
+
+    def fake_preview(self: rank.Ranker, c: stock.Candidate) -> np.ndarray:
+        img = np.zeros((4, 4, 3), np.uint8)
+        img[0, 0, 0] = 1  # every preview looks like a dolphin close-up
+        return img
+
+    monkeypatch.setattr(rank.Ranker, "preview", fake_preview)
+    r = rank.Ranker(FakeClip(), tmp_path, lambda p: None)
+
+    def tagged(i: int, tags: str) -> stock.Candidate:
+        return dataclasses.replace(_cand(i), tags=tags)
+
+    pool = [(0, "dolphin ocean", tagged(1, "dolphin, aquarium, zoo")),
+            (0, "dolphin ocean", tagged(2, "dolphin, 3d, animation")),
+            (0, "dolphin ocean", tagged(3, "dolphin, ocean, wild"))]  # fmt: skip
+    keys = [s.cand.key for s in r.rank("Dolphins in the ocean", pool)]
+    assert "pixabay:2" not in keys  # drawn/rendered: never
+    assert keys[0] == "pixabay:3"  # wild beats the aquarium (which is a duplicate here)

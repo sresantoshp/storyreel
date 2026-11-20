@@ -1,14 +1,19 @@
 """Run one ffmpeg job under a memory cap with heartbeat, timeout, and watchdog kill.
 
 ffmpeg is started with `-progress pipe:1`, so it prints a key=value block about twice a
-second. No output for `heartbeat_s` = hung → kill. stderr is drained continuously into a
-bounded buffer (a full pipe would otherwise block ffmpeg forever).
+second. ffmpeg >= 7 keeps printing those blocks on a timer even when its pipeline is
+stuck, so only blocks that MOVE (output time, size or frame count changes) count as a
+heartbeat. No movement for `heartbeat_s` = hung → kill, and the job is run once more
+(the hangs seen with ffmpeg 9 are intermittent scheduler stalls, not bad input).
+stderr is drained continuously into a bounded buffer (a full pipe would otherwise block
+ffmpeg forever).
 """
 
 from __future__ import annotations
 
 import collections
 import contextlib
+import logging
 import subprocess
 import threading
 import time
@@ -21,6 +26,7 @@ from storyreel.errors import ExitCode, StoryReelError, ToolFailedError, ToolTime
 from storyreel.jobs.limits import spawn
 from storyreel.watchdog import MemState, Watchdog
 
+log = logging.getLogger(__name__)
 _OOM_MARKERS = ("Cannot allocate memory", "Out of memory", "out of memory", "MemoryError")
 
 
@@ -38,6 +44,9 @@ class JobStats:
     stderr_tail: str = ""  # only when run with keep_stderr=True
 
 
+_MOVING = ("out_time_us", "total_size", "frame")
+
+
 def run_ffmpeg(
     argv: Sequence[str],
     *,
@@ -47,6 +56,32 @@ def run_ffmpeg(
     timeout_s: float = 6 * 3600,
     on_progress: Callable[[dict[str, str]], None] | None = None,
     keep_stderr: bool = False,
+    hang_retries: int = 1,
+) -> JobStats:
+    for attempt in range(hang_retries + 1):
+        try:
+            return _run_once(
+                argv, limit_bytes, watchdog, heartbeat_s, timeout_s, on_progress, keep_stderr
+            )
+        except _HungError as exc:
+            if attempt == hang_retries:
+                raise ToolTimeoutError(str(exc)) from None
+            log.warning("%s; running it again (attempt %d)", exc, attempt + 2)
+    raise AssertionError("unreachable")
+
+
+class _HungError(Exception):
+    pass
+
+
+def _run_once(
+    argv: Sequence[str],
+    limit_bytes: int | None,
+    watchdog: Watchdog | None,
+    heartbeat_s: float,
+    timeout_s: float,
+    on_progress: Callable[[dict[str, str]], None] | None,
+    keep_stderr: bool,
 ) -> JobStats:
     t0 = time.monotonic()
     try:
@@ -66,11 +101,15 @@ def run_ffmpeg(
     def read_progress() -> None:
         assert p.stdout is not None
         block: dict[str, str] = {}
+        last: tuple[str, ...] = ()
         for raw in p.stdout:
-            last_beat[0] = time.monotonic()
             key, _, value = raw.decode("utf-8", "replace").strip().partition("=")
             block[key] = value
             if key == "progress":
+                moved = tuple(block.get(k, "") for k in _MOVING)
+                if moved != last or value == "end":
+                    last = moved
+                    last_beat[0] = time.monotonic()
                 if on_progress:
                     on_progress(block)
                 block = {}
@@ -121,9 +160,7 @@ def run_ffmpeg(
     if reason == "memory":
         raise MemoryPressureError("Stopped a render step because memory was nearly exhausted.")
     if reason == "hung":
-        raise ToolTimeoutError(
-            f"{name} stopped responding for {heartbeat_s:.0f} s and was stopped."
-        )
+        raise _HungError(f"{name} made no progress for {heartbeat_s:.0f} s and was stopped")
     if reason == "timeout":
         raise ToolTimeoutError(f"{name} exceeded its {timeout_s:.0f} s time limit.")
     if p.returncode != 0:

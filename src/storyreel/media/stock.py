@@ -31,15 +31,22 @@ import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from storyreel.errors import StoryReelError
 from storyreel.paths import data_dir
+
+if TYPE_CHECKING:
+    from storyreel.media.rank import Ranker
 
 log = logging.getLogger(__name__)
 
 USER_AGENT = "StoryReel/0.1 (offline video maker)"
 MAX_DOWNLOAD_MB = 150
+# Bump when Candidate gains fields: older cached searches are then fetched again online.
+SEARCH_CACHE_VERSION = "v2"  # v2: preview thumbnails + library tags
+RANKED_QUERIES = 4  # searches pooled per scene when ranking with CLIP
+PER_QUERY = 12  # candidates per search that get a preview scored
 COMMONS_MAX_S = 180.0
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".m4v")
 PEXELS_LICENCE = "Pexels License (free commercial use, no attribution required)"
@@ -62,6 +69,8 @@ class Candidate:
     page_url: str
     author: str
     licence: str
+    thumb: str = ""  # preview picture URL (for CLIP ranking)
+    tags: str = ""  # the library's own keywords, comma separated
 
 
 @dataclass(frozen=True)
@@ -152,9 +161,10 @@ class Pexels:
         self.key = key
 
     def search(self, query: str, orientation: str, short_side: int) -> list[Candidate]:
-        q = urllib.parse.urlencode(
-            {"query": query, "per_page": 30, "orientation": orientation, "size": "medium"}
-        )
+        params: dict[str, str | int] = {"query": query, "per_page": 30, "size": "medium"}
+        if orientation in ("landscape", "portrait", "square"):
+            params["orientation"] = orientation
+        q = urllib.parse.urlencode(params)
         data = _get_json(f"https://api.pexels.com/videos/search?{q}", {"Authorization": self.key})
         out = []
         for v in data.get("videos", []):
@@ -180,6 +190,7 @@ class Pexels:
                     str(v.get("url") or ""),
                     str(user.get("name") or ""),
                     PEXELS_LICENCE,
+                    thumb=str(v.get("image") or ""),
                 )
             )
         return out
@@ -205,6 +216,8 @@ class Pixabay:
         data = _get_json(f"https://pixabay.com/api/videos/?{q}", {})
         out = []
         for v in data.get("hits", []):
+            if v.get("isAiGenerated") or v.get("isLowQuality"):
+                continue
             files = [
                 (int(f.get("width") or 0), int(f.get("height") or 0), str(f.get("url") or ""))
                 for f in (v.get("videos") or {}).values()
@@ -226,9 +239,20 @@ class Pixabay:
                     str(v.get("pageURL") or ""),
                     str(v.get("user") or ""),
                     PIXABAY_LICENCE,
+                    thumb=_pixabay_thumb(v),
+                    tags=str(v.get("tags") or ""),
                 )
             )
         return out
+
+
+def _pixabay_thumb(v: dict[str, Any]) -> str:
+    vids = v.get("videos") or {}
+    for size in ("small", "medium", "tiny", "large"):
+        t = str((vids.get(size) or {}).get("thumbnail") or "")
+        if t:
+            return t
+    return ""
 
 
 _TAG = re.compile(r"<[^>]+>")
@@ -392,6 +416,15 @@ def providers_from_env(names: str = "auto") -> list[Provider]:
     return out
 
 
+def _read_hits(f: Path) -> list[Candidate] | None:
+    if not f.is_file():
+        return None
+    try:
+        return [Candidate(**c) for c in json.loads(f.read_text(encoding="utf-8"))]
+    except (ValueError, TypeError):
+        return None
+
+
 class Library:
     def __init__(
         self,
@@ -400,29 +433,33 @@ class Library:
         *,
         offline: bool = False,
         progress: Callable[[str], None] | None = None,
+        ranker: Ranker | None = None,
     ) -> None:
         self.providers = providers
         self.cache = cache_dir or default_cache()
         self.offline = offline
         self.say = progress or (lambda m: None)
+        self.ranker = ranker
 
     # search results are cached forever: offline re-makes need them
     def _search(self, prov: Provider, query: str, orientation: str, short: int) -> list[Candidate]:
         if prov.name == "folder":
             return prov.search(query, orientation, short)
-        h = hashlib.sha1(f"{query}|{orientation}|{short}".encode()).hexdigest()[:16]  # noqa: S324
-        f = self.cache / "search" / prov.name / f"{h}.json"
-        if f.is_file():
-            try:
-                return [Candidate(**c) for c in json.loads(f.read_text(encoding="utf-8"))]
-            except (ValueError, TypeError):
-                pass
-        if self.offline:
-            return []
+        key = f"{query}|{orientation}|{short}"
+        f = self._search_file(prov.name, f"{SEARCH_CACHE_VERSION}|{key}")
+        cached = _read_hits(f)
+        if cached is not None:
+            return cached
+        if self.offline:  # an older StoryReel's results (no previews/tags) beat nothing
+            return _read_hits(self._search_file(prov.name, key)) or []
         res = prov.search(query, orientation, short)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps([asdict(c) for c in res]), encoding="utf-8")
         return res
+
+    def _search_file(self, provider: str, key: str) -> Path:
+        h = hashlib.sha1(key.encode()).hexdigest()[:16]  # noqa: S324 (file name only)
+        return self.cache / "search" / provider / f"{h}.json"
 
     def _file_for(self, c: Candidate) -> Path:
         prov, ident = c.key.split(":", 1)
@@ -466,6 +503,24 @@ class Library:
         dest.with_suffix(".json").write_text(json.dumps(asdict(c)), encoding="utf-8")
         return True
 
+    def _hits(self, q: str, orientation: str, short: int, failures: list[StockError]
+              ) -> list[Candidate]:  # fmt: skip
+        out: list[Candidate] = []
+        for prov in self.providers:
+            try:
+                out += self._search(prov, q, orientation, short)
+            except StockError as exc:
+                failures.append(exc)
+                log.warning("%s: %s", prov.name, exc)
+        return out
+
+    def _clip(self, c: Candidate) -> Clip | None:
+        dest = self._file_for(c)
+        if not self._download(c, dest):
+            return None
+        return Clip(c.key, dest, c.width, c.height, c.duration_s, c.page_url, c.author,
+                    c.licence)  # fmt: skip
+
     def find(
         self,
         queries: list[str],
@@ -475,39 +530,45 @@ class Library:
         orientation: str,
         short_side: int,
         exclude: set[str],
+        describe: str = "",
     ) -> list[Clip]:
-        """Up to `count` different clips at least `seconds` long, best query first.
-        Clips in `exclude` (already used in this story) are skipped."""
+        """Up to `count` different clips at least `seconds` long. Clips in `exclude`
+        (already used in this story) are skipped.
+
+        With a ranker, candidates from the first RANKED_QUERIES searches are scored with
+        CLIP against `describe` (the narration) and their query; otherwise the first
+        hits of the best query win."""
+        failures: list[StockError] = []
         out: list[Clip] = []
         seen = set(exclude)
-        for q in queries:
-            for prov in self.providers:
-                try:
-                    hits = self._search(prov, q, orientation, short_side)
-                except StockError as exc:
-                    if prov is self.providers[-1] and not out:
-                        raise
-                    log.warning("%s: %s", prov.name, exc)
-                    continue
-                for c in hits:
+        if self.ranker is None:
+            for q in queries:
+                for c in self._hits(q, orientation, short_side, failures):
                     if c.key in seen or 0 < c.duration_s < seconds:
                         continue
-                    dest = self._file_for(c)
-                    if not self._download(c, dest):
+                    clip = self._clip(c)
+                    if clip is None:
                         continue
                     seen.add(c.key)
-                    out.append(
-                        Clip(
-                            c.key,
-                            dest,
-                            c.width,
-                            c.height,
-                            c.duration_s,
-                            c.page_url,
-                            c.author,
-                            c.licence,
-                        )
-                    )
+                    out.append(clip)
                     if len(out) >= count:
                         return out
+        else:
+            pool: list[tuple[int, str, Candidate]] = []
+            for qi, q in enumerate(queries[:RANKED_QUERIES]):
+                for c in self._hits(q, orientation, short_side, failures)[:PER_QUERY]:
+                    if c.key in seen or 0 < c.duration_s < seconds:
+                        continue
+                    seen.add(c.key)
+                    pool.append((qi, q, c))
+            ranked = self.ranker.rank(describe, pool)
+            for s in ranked:
+                clip = self._clip(s.cand)
+                if clip is not None:
+                    out.append(clip)
+                if len(out) >= count:
+                    break
+            out = self.ranker.wide_first(out, {s.cand.key: s for s in ranked})
+        if not out and failures and len(failures) >= len(self.providers):
+            raise failures[0]
         return out

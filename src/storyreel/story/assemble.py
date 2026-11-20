@@ -298,6 +298,7 @@ def _realistic_picture(
     shots = real.plan_shots(plan.scenes, starts, durs, find)
     say(f"footage: {len(shots)} shots from {len({s.clip.key for s in shots})} clips")
     assets: dict[str, int] = {}
+    match = _shot_match(shots, ffmpeg)
     for n, shot in enumerate(shots):
         if shot.clip.key not in assets:
             assets[shot.clip.key] = _import_footage(p, ffmpeg, ffprobe, shot.clip)
@@ -313,6 +314,8 @@ def _realistic_picture(
         cover = max(w / fw, h / fh)
         drift = (1 if n % 2 else -1) * round(0.012 * w)
         ed.ken_burns(cid, zoom_from=cover, zoom_to=cover * real.PUSH_IN, pan_x=drift, ease="linear")
+        if match[n]:
+            ed.add_effect(cid, "colormatch", **match[n])
     real.credits_path(root).write_text(real.credits(shots), encoding="utf-8")
 
     end = _snap(rate, total)
@@ -333,6 +336,20 @@ def _realistic_picture(
     b = ed.add_clip(fade_t, end - fout, fout, color="#000000")
     ed.add_keyframe(b, "opacity", 0, 0.0)
     ed.add_keyframe(b, "opacity", fout, 1.0)
+
+
+def _shot_match(shots: list[real.Shot], ffmpeg: Path) -> list[dict[str, Any]]:
+    """Colour-match parameters per shot from a frame in the middle of the part used."""
+    from storyreel.render.effects import lab_stats, u8_to_f
+    from storyreel.vision.frames import grab
+
+    stats: list[tuple[list[float], list[float]] | None] = []
+    for sh in shots:
+        img = grab(ffmpeg, sh.clip.path, at_s=1.0 + sh.length_s / 2, width=160)
+        stats.append(lab_stats(u8_to_f(img)) if img is not None else None)
+    ok = [s for s in stats if s is not None]
+    params = iter(real.shot_match(ok))
+    return [next(params) if s is not None else {} for s in stats]
 
 
 def real_fade(seconds: float, total: float) -> float:
