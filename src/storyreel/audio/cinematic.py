@@ -37,7 +37,7 @@ def _tv_filter(x: F64, sr: int, gain: Callable[[F64, float], F64], ctl: F64) -> 
     win = np.sqrt(0.5 - 0.5 * np.cos(2 * np.pi * np.arange(frame) / frame))
     padded = np.concatenate([np.zeros(frame), x, np.zeros(frame)])
     out = np.zeros(n + 2 * frame)
-    freqs = np.fft.rfftfreq(frame, 1.0 / sr)
+    freqs = np.asarray(np.fft.rfftfreq(frame, 1.0 / sr), np.float64)
     for s in range(0, n + frame, hop):
         c = float(ctl[min(max(s - frame // 2, 0), n - 1)])
         seg = np.fft.irfft(np.fft.rfft(padded[s : s + frame] * win) * gain(freqs, c), frame)
